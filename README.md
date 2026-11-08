@@ -4,8 +4,9 @@ The faculty phone listens for ESP32 room beacons (names like `KALAM-4G2`) and
 updates the faculty member's room in Firebase automatically. Students see it live.
 
 ## Rules used (from the ESP32 test)
-- Signal stronger than -65 dBm: inside that room
-- Weaker than -80 dBm, or no signal for 15 s: left the room
+- Signal stronger than -65 dBm for 1 minute: inside that room
+- Weaker than -80 dBm (or no signal) for 10 minutes: left the room
+- "Demo timing" switch in the app: 10 seconds in, 30 seconds out
 - Entering your own cabin marks the cabin door Open; leaving marks it Closed
 
 ## Build the APK without installing anything (GitHub)

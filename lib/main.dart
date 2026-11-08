@@ -16,7 +16,13 @@ import 'rooms.dart';
 const int enterRssi = -65;          // stronger than this = inside the room
 const int leaveRssi = -80;          // weaker than this = left the room
 const int switchMargin = 6;         // another room must be this much stronger to switch
-const Duration lostAfter = Duration(seconds: 15); // no signal for this long = left
+const Duration lostAfter = Duration(seconds: 15); // no signal for this long = not hearing that room now
+// Timing (normal): stay 1 minute to count as "in", be away 10 minutes to count as "left".
+const Duration enterHoldNormal = Duration(minutes: 1);
+const Duration leaveHoldNormal = Duration(minutes: 10);
+// Timing (demo switch): fast, so it can be shown live.
+const Duration enterHoldDemo = Duration(seconds: 10);
+const Duration leaveHoldDemo = Duration(seconds: 30);
 const Duration heartbeat = Duration(minutes: 5);  // keep "updated" fresh while in a room
 const String facultyCollection = 'faculty';
 
@@ -245,6 +251,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _locationServiceOn = true;
   DateTime? _scanStartedAt;
   DateTime? _lastAnyResult;   // last time the scan returned anything at all
+  Room? _candidate;           // a room the phone hears strongly but has not confirmed yet
+  DateTime? _candidateSince;
+  DateTime? _lastInRoom;      // last time the current room was clearly heard
+  bool _demoTiming = false;
+  Duration get _enterHold => _demoTiming ? enterHoldDemo : enterHoldNormal;
+  Duration get _leaveHold => _demoTiming ? leaveHoldDemo : leaveHoldNormal;
   Room? _room;                       // room the app has decided you are in
   Map<String, dynamic>? _me;         // your faculty record
   String? _problem;                  // permission / bluetooth message
@@ -356,14 +368,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!scanAlive && now.difference(started) > const Duration(seconds: 20)) _startScan(force: true);
       if (now.difference(started) > const Duration(minutes: 10)) _startScan(force: true); // regular refresh
     }
-    // While the scan is silent, keep the current room for up to a minute instead of saying "left".
-    if (!scanAlive && _room != null && _lastAnyResult != null && now.difference(_lastAnyResult!) < const Duration(minutes: 1)) {
-      setState(() {});
-      return;
-    }
-    _seen.removeWhere((_, s) => now.difference(s.last) > const Duration(seconds: 30));
+    _seen.removeWhere((_, s) => now.difference(s.last) > const Duration(minutes: 2));
 
-    // strongest recent beacon
+    // strongest room the phone hears right now
     MapEntry<String, Seen>? best;
     for (final e in _seen.entries) {
       if (now.difference(e.value.last) > lostAfter) continue;
@@ -371,18 +378,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (best == null || e.value.rssi > best.value.rssi) best = e;
     }
 
+    // is the current room still clearly heard?
+    Seen? cur;
+    bool curOk = false;
+    if (_room != null) {
+      cur = _seen[_room!.beaconName];
+      curOk = cur != null && now.difference(cur.last) <= lostAfter && cur.rssi >= leaveRssi;
+      if (curOk) _lastInRoom = now;
+    }
+
+    // a different room heard strongly becomes a candidate; it must stay that way for the enter time
+    Room? cand;
+    if (best != null && best.value.rssi >= enterRssi && best.key != _room?.beaconName) {
+      final muchStronger = !curOk || best.value.rssi > cur!.rssi + switchMargin;
+      if (muchStronger) cand = parseBeacon(best.key);
+    }
+    if (cand == null) {
+      _candidate = null;
+      _candidateSince = null;
+    } else if (_candidate?.beaconName != cand.beaconName) {
+      _candidate = cand;
+      _candidateSince = now;
+    }
+
     Room? next = _room;
-    if (_room == null) {
-      if (best != null && best.value.rssi >= enterRssi) next = parseBeacon(best.key);
-    } else {
-      final cur = _seen[_room!.beaconName];
-      final curOk = cur != null && now.difference(cur.last) <= lostAfter && cur.rssi >= leaveRssi;
-      if (!curOk) {
-        next = (best != null && best.value.rssi >= enterRssi) ? parseBeacon(best.key) : null;
-      } else if (best != null && best.key != _room!.beaconName &&
-          best.value.rssi >= enterRssi && best.value.rssi > cur.rssi + switchMargin) {
-        next = parseBeacon(best.key);
-      }
+    if (_candidate != null && now.difference(_candidateSince!) >= _enterHold) {
+      next = _candidate;
+      _lastInRoom = now;
+      _candidate = null;
+      _candidateSince = null;
+    } else if (_room != null && _lastInRoom != null && now.difference(_lastInRoom!) >= _leaveHold) {
+      next = null; // away long enough: left the room
     }
 
     final changed = next?.beaconName != _room?.beaconName;
@@ -392,6 +418,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } else if (_room != null && (_lastWrite == null || now.difference(_lastWrite!) > heartbeat)) {
       _push(_room, heartbeatOnly: true);
     }
+  }
+
+  String _fmt(Duration d) {
+    if (d.isNegative) return '0:00';
+    final m = d.inMinutes, sec = d.inSeconds % 60;
+    return '$m:${sec.toString().padLeft(2, '0')}';
   }
 
   bool _isOwnCabin(Room r) {
@@ -474,6 +506,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ? 'Walk into a room with a Kalam beacon and it will update by itself.'
                   : (_isOwnCabin(_room!) ? 'Your own cabin. Students see you as "In cabin".' : 'Students see you as "Taking class" here.'),
                   style: TextStyle(color: scheme.onSurfaceVariant)),
+              if (_candidate != null && _candidateSince != null) ...[
+                const SizedBox(height: 10),
+                Text('Detected ${_candidate!.fullLabel}. Confirming in ${_fmt(_enterHold - now.difference(_candidateSince!))}…',
+                    style: TextStyle(color: scheme.primary, fontWeight: FontWeight.w600)),
+              ] else if (_room != null && _lastInRoom != null && now.difference(_lastInRoom!) > lostAfter) ...[
+                const SizedBox(height: 10),
+                Text('You stepped out. Students will see "Not in any room" in ${_fmt(_leaveHold - now.difference(_lastInRoom!))} unless you come back.',
+                    style: TextStyle(color: scheme.tertiary, fontWeight: FontWeight.w600)),
+              ],
             ]),
           ),
         ),
@@ -535,7 +576,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     'If this stays red for over a minute, close the app fully, wait 30 seconds and open it again. '
                     'Also check that Location is on and "Nearby devices" is allowed.'),
               ],
-              const SizedBox(height: 12),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Demo timing'),
+                subtitle: Text(_demoTiming ? 'In after 10 s, out after 30 s' : 'In after 1 min, out after 10 min'),
+                value: _demoTiming,
+                onChanged: (v) => setState(() => _demoTiming = v),
+              ),
+              const SizedBox(height: 4),
               Wrap(spacing: 8, runSpacing: 8, children: [
                 FilledButton.icon(
                   onPressed: () async { await _checkPermissions(); await _startScan(force: true); },
