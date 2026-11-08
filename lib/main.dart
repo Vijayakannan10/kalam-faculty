@@ -245,31 +245,26 @@ class _StudentScreenState extends State<StudentScreen> {
     final open = f['cabinOpen'] == true;
     final gender = f['gender'] == 'F' ? 'L' : 'G';
     final cabin = 'Floor ${f['cabinFloor']} · Cabin $gender${f['cabinNo']}';
-    final green = Colors.green.shade600, red = Colors.red.shade600;
+    final color = open ? Colors.green.shade600 : Colors.red.shade600;
+    final ms = (f['updatedAt'] as num?)?.toInt();
+    final since = _ago(ms).replaceFirst('updated ', '');
     return Card(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: BorderSide(color: color, width: 2)),
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Row(children: [
-          CircleAvatar(radius: 24, child: Text(_initials((f['name'] ?? '?').toString()))),
+          Icon(open ? Icons.meeting_room : Icons.door_front_door, color: color, size: 44),
           const SizedBox(width: 14),
           Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text((f['name'] ?? 'Faculty').toString(), style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
-            const SizedBox(height: 2),
-            Text(cabin, style: TextStyle(color: scheme.onSurfaceVariant)),
-            const SizedBox(height: 2),
-            Text(_ago((f['updatedAt'] as num?)?.toInt()), style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
-          ])),
-          const SizedBox(width: 8),
-          Column(children: [
-            Icon(open ? Icons.meeting_room : Icons.door_front_door, color: open ? green : red, size: 30),
+            Text((f['name'] ?? 'Faculty').toString(), style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
             const SizedBox(height: 4),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(color: (open ? green : red).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
-              child: Text(open ? 'Open · Inside' : 'Closed · Out',
-                  style: TextStyle(color: open ? green : red, fontWeight: FontWeight.w700, fontSize: 12)),
-            ),
-          ]),
+            Text(open ? 'Inside the cabin · Door OPEN' : 'Went out · Door CLOSED',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: color)),
+            const SizedBox(height: 2),
+            Text(open ? 'Go to $cabin' : 'Cabin: $cabin', style: TextStyle(color: scheme.onSurfaceVariant)),
+            if (ms != null)
+              Text(open ? 'Came in $since' : 'Left $since', style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
+          ])),
         ]),
       ),
     );
@@ -316,7 +311,7 @@ class PickFacultyScreen extends StatelessWidget {
             children: [
               const Padding(
                 padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
-                child: Text('Pick your name. This phone will then update your room automatically.'),
+                child: Text('Pick your name. This phone will then update your cabin door automatically. Long-press a name to remove it.'),
               ),
               for (final d in docs)
                 ListTile(
@@ -325,6 +320,19 @@ class PickFacultyScreen extends StatelessWidget {
                   subtitle: Text('Cabin: Floor ${d.data()['cabinFloor']}, ${d.data()['gender'] == 'F' ? 'L' : 'G'}${d.data()['cabinNo']}'),
                   trailing: const Icon(Icons.chevron_right),
                   onTap: () => _choose(context, d.id),
+                  onLongPress: () async {
+                    final yes = await showDialog<bool>(context: context, builder: (c) => AlertDialog(
+                      title: Text('Remove ${d.data()['name'] ?? 'this faculty'}?'),
+                      content: const Text('This removes the entry for everyone. It cannot be undone.'),
+                      actions: [
+                        TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+                        FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Remove')),
+                      ],
+                    ));
+                    if (yes == true) {
+                      try { await d.reference.delete(); } catch (_) {}
+                    }
+                  },
                 ),
             ],
           );
