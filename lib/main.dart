@@ -238,12 +238,13 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final Map<String, Seen> _seen = {};
   final Map<String, DateTime> _allDevices = {}; // every Bluetooth device the scan returns (for diagnosis)
   Map<Permission, PermissionStatus> _perms = {};
   bool _locationServiceOn = true;
   DateTime? _scanStartedAt;
+  DateTime? _lastAnyResult;   // last time the scan returned anything at all
   Room? _room;                       // room the app has decided you are in
   Map<String, dynamic>? _me;         // your faculty record
   String? _problem;                  // permission / bluetooth message
@@ -259,6 +260,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     WakelockPlus.enable();
+    WidgetsBinding.instance.addObserver(this);
     _meSub = _doc.snapshots().listen((s) => setState(() => _me = s.data()));
     _start();
     _tick = Timer.periodic(const Duration(seconds: 2), (_) => _evaluate());
@@ -266,6 +268,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _tick?.cancel();
     _scanSub?.cancel();
     _adapterSub?.cancel();
@@ -300,10 +303,21 @@ class _HomeScreenState extends State<HomeScreen> {
     try { await FlutterBluePlus.turnOn(); } catch (_) {}
   }
 
-  Future<void> _startScan() async {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Android often stops the scan when the screen turns off or the app goes to the background.
+    if (state == AppLifecycleState.resumed) _startScan(force: true);
+  }
+
+  Future<void> _startScan({bool force = false}) async {
+    final started = _scanStartedAt;
+    // Android blocks apps that start scans too often (5 per 30 s), so never restart faster than every 8 s.
+    if (started != null && DateTime.now().difference(started) < const Duration(seconds: 8)) return;
+    if (!force && started != null && FlutterBluePlus.isScanningNow) return;
     await _scanSub?.cancel();
     _scanSub = FlutterBluePlus.onScanResults.listen((results) {
       final now = DateTime.now();
+      if (results.isNotEmpty) _lastAnyResult = now;
       for (final r in results) {
         _allDevices[r.device.remoteId.str] = now;
         String name = r.advertisementData.advName;
@@ -334,6 +348,19 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _evaluate() {
     final now = DateTime.now();
+
+    // Watchdog: if the scan has gone silent, restart it (Android stops scans without telling the app).
+    final scanAlive = _lastAnyResult != null && now.difference(_lastAnyResult!) < const Duration(seconds: 12);
+    final started = _scanStartedAt;
+    if (FlutterBluePlus.adapterStateNow == BluetoothAdapterState.on && started != null) {
+      if (!scanAlive && now.difference(started) > const Duration(seconds: 20)) _startScan(force: true);
+      if (now.difference(started) > const Duration(minutes: 10)) _startScan(force: true); // regular refresh
+    }
+    // While the scan is silent, keep the current room for up to a minute instead of saying "left".
+    if (!scanAlive && _room != null && _lastAnyResult != null && now.difference(_lastAnyResult!) < const Duration(minutes: 1)) {
+      setState(() {});
+      return;
+    }
     _seen.removeWhere((_, s) => now.difference(s.last) > const Duration(seconds: 30));
 
     // strongest recent beacon
@@ -504,13 +531,14 @@ class _HomeScreenState extends State<HomeScreen> {
               Text('Location (GPS) switch: ${_locationServiceOn ? 'On' : 'Off'}'),
               if (noResults) ...[
                 const SizedBox(height: 10),
-                const Text('The phone is not giving any Bluetooth results to this app. '
-                    'Turn on Location, then in App settings allow "Nearby devices" and Location with "Use precise location" on.'),
+                const Text('No Bluetooth results right now. The app restarts the scan by itself every 20 seconds. '
+                    'If this stays red for over a minute, close the app fully, wait 30 seconds and open it again. '
+                    'Also check that Location is on and "Nearby devices" is allowed.'),
               ],
               const SizedBox(height: 12),
               Wrap(spacing: 8, runSpacing: 8, children: [
                 FilledButton.icon(
-                  onPressed: () async { await _checkPermissions(); await _startScan(); },
+                  onPressed: () async { await _checkPermissions(); await _startScan(force: true); },
                   icon: const Icon(Icons.refresh), label: const Text('Scan again'),
                 ),
                 OutlinedButton.icon(
