@@ -2,8 +2,11 @@
 that `flutter create` generates. Run from the project root (the GitHub build does this)."""
 import pathlib
 import re
+import sys
 
 root = pathlib.Path(".")
+mode = sys.argv[1] if len(sys.argv) > 1 else "faculty"
+label = "Kalam Student" if mode == "student" else "Kalam Faculty"
 
 # 1. Permissions + app name
 manifest = root / "android/app/src/main/AndroidManifest.xml"
@@ -25,7 +28,7 @@ perms = """
 """
 if "BLUETOOTH_SCAN" not in s:
     s = re.sub(r"(<manifest[^>]*>)", lambda m: m.group(1) + perms, s, count=1)
-s = re.sub(r'android:label="[^"]*"', 'android:label="Kalam Finder"', s, count=1)
+s = re.sub(r'android:label="[^"]*"', f'android:label="{label}"', s, count=1)
 service = """        <service
             android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
             android:foregroundServiceType="connectedDevice"
@@ -94,3 +97,17 @@ for name in ["android/app/build.gradle", "android/app/build.gradle.kts"]:
         t2 = t2.replace("signingConfig signingConfigs.debug", "signingConfig signingConfigs.kalam")
     p.write_text(t2)
     print(f"{name}: fixed signing key added" if "signingConfigs.kalam" in t2 or 'getByName("kalam")' in t2 else f"{name}: signing line not found")
+
+# 5. Student app: its own package name, so both apps can be installed on one phone
+if mode == "student":
+    for name in ["android/app/build.gradle", "android/app/build.gradle.kts"]:
+        p = root / name
+        if not p.exists():
+            continue
+        t = p.read_text()
+        # change only the applicationId (the namespace must stay, it matches MainActivity's package)
+        t2 = re.sub(r'(applicationId\s*=?\s*")in\.kalamfinder\.kalam_faculty"', r'\g<1>in.kalamfinder.kalam_student"', t)
+        p.write_text(t2)
+        if "applicationId" in t2 and "kalam_student" not in t2.split("applicationId", 1)[1].split("\n", 1)[0]:
+            raise SystemExit(f"{name}: could not change applicationId to kalam_student")
+        print(f"{name}: package set to in.kalamfinder.kalam_student")

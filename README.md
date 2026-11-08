@@ -1,4 +1,14 @@
-# Kalam Faculty app (8th Block, Abdul Kalam Block)
+# Kalam Finder (8th Block, Abdul Kalam Block)
+
+Two Android apps are built from this code:
+- **Kalam Faculty** (`lib/main_faculty.dart`): open it once in the morning. It runs all day in the
+  background and reports the cabin door: Open when you are in your cabin, Closed when you leave.
+- **Kalam Student** (`lib/main_student.dart`): see which faculty are in their cabin right now.
+
+Download links (always the newest build):
+- https://github.com/Vijayakannan10/kalam-faculty/releases/latest/download/kalam-faculty.apk
+- https://github.com/Vijayakannan10/kalam-faculty/releases/latest/download/kalam-student.apk
+
 
 The faculty phone listens for ESP32 room beacons (names like `KALAM-4G2`) and
 updates the faculty member's room in Firebase automatically. Students see it live.

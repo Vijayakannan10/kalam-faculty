@@ -24,7 +24,16 @@ const Duration leaveHold = Duration(seconds: 15);
 const Duration heartbeat = Duration(minutes: 5);  // keep "updated" fresh while in a room
 const String facultyCollection = 'faculty';
 
-Future<void> main() async {
+// Two apps are built from this code:
+//   lib/main_faculty.dart -> "Kalam Faculty" (runs all day, reports the cabin door)
+//   lib/main_student.dart -> "Kalam Student" (shows who is in their cabin)
+enum AppMode { faculty, student }
+AppMode appMode = AppMode.faculty;
+
+Future<void> main() => runKalam(AppMode.faculty);
+
+Future<void> runKalam(AppMode mode) async {
+  appMode = mode;
   WidgetsFlutterBinding.ensureInitialized();
   String? initError;
   if (!firebaseConfigured) {
@@ -38,7 +47,7 @@ Future<void> main() async {
   }
   // Background mode: a small "Kalam Finder is running" notification keeps the app alive
   // so the cabin door keeps updating while the phone is locked or in a pocket.
-  FlutterForegroundTask.init(
+  if (mode == AppMode.faculty) FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
       channelId: 'kalam_finder',
       channelName: 'Kalam Finder',
@@ -62,11 +71,13 @@ class KalamApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Kalam Faculty',
+      title: appMode == AppMode.student ? 'Kalam Student' : 'Kalam Faculty',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(colorSchemeSeed: const Color(0xFF2B4FB8), useMaterial3: true),
       darkTheme: ThemeData(colorSchemeSeed: const Color(0xFF2B4FB8), useMaterial3: true, brightness: Brightness.dark),
-      home: initError != null ? MessageScreen(message: initError!) : const StartScreen(),
+      home: initError != null
+          ? MessageScreen(message: initError!)
+          : (appMode == AppMode.student ? const StudentScreen() : const StartScreen()),
     );
   }
 }
@@ -97,19 +108,11 @@ class _StartScreenState extends State<StartScreen> {
 
   Future<void> _check() async {
     final prefs = await SharedPreferences.getInstance();
-    final role = prefs.getString('role');
     final id = prefs.getString('facultyId');
     // A faculty is registered on this phone: keep their cabin scan running whatever screen is open.
     if (id != null) Presence.instance.start(id);
     if (!mounted) return;
-    Widget next;
-    if (role == 'student') {
-      next = const StudentScreen();
-    } else if (role == 'faculty' && id != null) {
-      next = HomeScreen(facultyId: id);
-    } else {
-      next = const RoleScreen();
-    }
+    final Widget next = id != null ? HomeScreen(facultyId: id) : const PickFacultyScreen();
     Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => next));
   }
 
@@ -215,7 +218,7 @@ class _StudentScreenState extends State<StudentScreen> {
       appBar: AppBar(
         title: const Text('Find faculty'),
         actions: [
-          if (!widget.fromFaculty)
+          if (!widget.fromFaculty && appMode != AppMode.student)
             IconButton(onPressed: _switchRole, icon: const Icon(Icons.swap_horiz), tooltip: 'Switch to faculty'),
         ],
       ),
@@ -782,7 +785,7 @@ class _HomeScreenState extends State<HomeScreen> {
     await prefs.remove('facultyId');
     await prefs.remove('role');
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const RoleScreen()));
+    Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const PickFacultyScreen()));
   }
 
   @override
@@ -808,10 +811,6 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: Text(me?['name'] ?? 'Kalam Faculty'),
         actions: [
-          IconButton(
-            onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const StudentScreen(fromFaculty: true))),
-            icon: const Icon(Icons.visibility), tooltip: 'Student view',
-          ),
           IconButton(onPressed: _logout, icon: const Icon(Icons.switch_account), tooltip: 'Change faculty'),
         ],
       ),

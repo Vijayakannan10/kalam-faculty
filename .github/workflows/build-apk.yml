@@ -32,13 +32,24 @@ jobs:
       - name: Get packages
         run: flutter pub get 2>&1 | tee pub.log
 
-      - name: Build APK
-        run: flutter build apk --release 2>&1 | tee build.log
+      - name: Build Kalam Faculty
+        run: |
+          flutter build apk --release -t lib/main_faculty.dart 2>&1 | tee build.log
+          cp build/app/outputs/flutter-apk/app-release.apk kalam-faculty.apk
+          cp kalam-faculty.apk app-release.apk
+
+      - name: Build Kalam Student
+        run: |
+          python3 tool/patch_android.py student
+          flutter build apk --release -t lib/main_student.dart 2>&1 | tee -a build.log
+          cp build/app/outputs/flutter-apk/app-release.apk kalam-student.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: kalam-faculty-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          name: kalam-apps
+          path: |
+            kalam-faculty.apk
+            kalam-student.apk
 
       - name: Publish APK as a download link
         uses: softprops/action-gh-release@v2
@@ -46,7 +57,10 @@ jobs:
           tag_name: v1.0.${{ github.run_number }}
           name: Kalam Faculty ${{ github.run_number }}
           make_latest: true
-          files: build/app/outputs/flutter-apk/app-release.apk
+          files: |
+            kalam-faculty.apk
+            kalam-student.apk
+            app-release.apk
 
       - name: Publish the error log if the build fails
         if: failure()
