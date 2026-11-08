@@ -17,12 +17,10 @@ const int enterRssi = -65;          // stronger than this = inside the room
 const int leaveRssi = -80;          // weaker than this = left the room
 const int switchMargin = 6;         // another room must be this much stronger to switch
 const Duration lostAfter = Duration(seconds: 15); // no signal for this long = not hearing that room now
-// Timing (normal): stay 1 minute to count as "in", be away 10 minutes to count as "left".
-const Duration enterHoldNormal = Duration(minutes: 1);
-const Duration leaveHoldNormal = Duration(minutes: 10);
-// Timing (demo switch): fast, so it can be shown live.
-const Duration enterHoldDemo = Duration(seconds: 10);
-const Duration leaveHoldDemo = Duration(seconds: 30);
+// Near the cabin beacon = inside (door Open). Away from it = outside (door Closed).
+// The short times only smooth out Bluetooth signal drops; they do not try to predict anything.
+const Duration enterHold = Duration(seconds: 3);
+const Duration leaveHold = Duration(seconds: 15);
 const Duration heartbeat = Duration(minutes: 5);  // keep "updated" fresh while in a room
 const String facultyCollection = 'faculty';
 
@@ -254,9 +252,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Room? _candidate;           // a room the phone hears strongly but has not confirmed yet
   DateTime? _candidateSince;
   DateTime? _lastInRoom;      // last time the current room was clearly heard
-  bool _demoTiming = false;
-  Duration get _enterHold => _demoTiming ? enterHoldDemo : enterHoldNormal;
-  Duration get _leaveHold => _demoTiming ? leaveHoldDemo : leaveHoldNormal;
+  Duration get _enterHold => enterHold;
+  Duration get _leaveHold => leaveHold;
   Room? _room;                       // room the app has decided you are in
   Map<String, dynamic>? _me;         // your faculty record
   String? _problem;                  // permission / bluetooth message
@@ -506,15 +503,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ? 'Walk into a room with a Kalam beacon and it will update by itself.'
                   : (_isOwnCabin(_room!) ? 'Your own cabin. Students see you as "In cabin".' : 'Students see you as "Taking class" here.'),
                   style: TextStyle(color: scheme.onSurfaceVariant)),
-              if (_candidate != null && _candidateSince != null) ...[
-                const SizedBox(height: 10),
-                Text('Detected ${_candidate!.fullLabel}. Confirming in ${_fmt(_enterHold - now.difference(_candidateSince!))}…',
-                    style: TextStyle(color: scheme.primary, fontWeight: FontWeight.w600)),
-              ] else if (_room != null && _lastInRoom != null && now.difference(_lastInRoom!) > lostAfter) ...[
-                const SizedBox(height: 10),
-                Text('You stepped out. Students will see "Not in any room" in ${_fmt(_leaveHold - now.difference(_lastInRoom!))} unless you come back.',
-                    style: TextStyle(color: scheme.tertiary, fontWeight: FontWeight.w600)),
-              ],
             ]),
           ),
         ),
@@ -576,13 +564,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     'If this stays red for over a minute, close the app fully, wait 30 seconds and open it again. '
                     'Also check that Location is on and "Nearby devices" is allowed.'),
               ],
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Demo timing'),
-                subtitle: Text(_demoTiming ? 'In after 10 s, out after 30 s' : 'In after 1 min, out after 10 min'),
-                value: _demoTiming,
-                onChanged: (v) => setState(() => _demoTiming = v),
-              ),
               const SizedBox(height: 4),
               Wrap(spacing: 8, runSpacing: 8, children: [
                 FilledButton.icon(
