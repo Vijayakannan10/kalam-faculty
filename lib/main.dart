@@ -608,6 +608,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return '$m:${sec.toString().padLeft(2, '0')}';
   }
 
+  String _myCabinLabel() {
+    final me = _me;
+    if (me == null) return 'not set';
+    return 'Floor ${me['cabinFloor']}, ${me['gender'] == 'F' ? 'L' : 'G'}${me['cabinNo']}';
+  }
+
+  Future<void> _makeMyCabin(Room r) async {
+    final gents = r.idx <= 4;
+    try {
+      await _doc.update({
+        'cabinFloor': r.floor,
+        'gender': gents ? 'M' : 'F',
+        'cabinNo': gents ? r.idx : r.idx - 4,
+        'status': 'cabin', 'floor': r.floor, 'idx': r.idx,
+        'cabinOpen': true,
+        'updatedAt': DateTime.now().millisecondsSinceEpoch,
+      });
+    } catch (_) {}
+  }
+
   bool _isOwnCabin(Room r) {
     final me = _me;
     if (me == null) return false;
@@ -624,7 +644,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (room != null) {
         final own = _isOwnCabin(room);
         data.addAll({'status': own ? 'cabin' : 'class', 'floor': room.floor, 'idx': room.idx});
-        if (own) data['cabinOpen'] = true;
+        data['cabinOpen'] = own; // door is open only when you are in your own cabin
       } else {
         data['status'] = 'away';
         data['cabinOpen'] = false;
@@ -692,9 +712,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               Text(_room?.fullLabel ?? 'Not in any room', style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w700)),
               const SizedBox(height: 6),
               Text(_room == null
-                  ? 'Walk into a room with a Kalam beacon and it will update by itself.'
-                  : (_isOwnCabin(_room!) ? 'Your own cabin. Students see you as "In cabin".' : 'Students see you as "Taking class" here.'),
+                  ? 'You are away from your cabin beacon.'
+                  : (_isOwnCabin(_room!) ? 'This is your cabin.' : 'This is not your saved cabin.'),
                   style: TextStyle(color: scheme.onSurfaceVariant)),
+              if (_room != null && !_isOwnCabin(_room!) && _room!.idx <= 8) ...[
+                const SizedBox(height: 10),
+                Text('Your saved cabin is ${_myCabinLabel()}, so students see your door CLOSED. '
+                    'If this room is your cabin, tap below.',
+                    style: TextStyle(color: scheme.error, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 8),
+                FilledButton.icon(
+                  onPressed: () => _makeMyCabin(_room!),
+                  icon: const Icon(Icons.check),
+                  label: Text('Make ${_room!.label} my cabin'),
+                ),
+              ],
             ]),
           ),
         ),
@@ -703,18 +735,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           child: Padding(
             padding: const EdgeInsets.all(20),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('MY CABIN DOOR', style: TextStyle(fontSize: 12, letterSpacing: 1.2, color: scheme.onSurfaceVariant)),
+              Text('WHAT STUDENTS SEE', style: TextStyle(fontSize: 12, letterSpacing: 1.2, color: scheme.onSurfaceVariant)),
               const SizedBox(height: 12),
-              SegmentedButton<bool>(
-                segments: const [
-                  ButtonSegment(value: true, label: Text('Open'), icon: Icon(Icons.door_front_door_outlined)),
-                  ButtonSegment(value: false, label: Text('Closed'), icon: Icon(Icons.lock_outline)),
-                ],
-                selected: {cabinOpen},
-                onSelectionChanged: (s) => _setCabin(s.first),
-              ),
+              Row(children: [
+                Icon(cabinOpen ? Icons.meeting_room : Icons.door_front_door,
+                    size: 44, color: cabinOpen ? Colors.green.shade600 : Colors.red.shade600),
+                const SizedBox(width: 14),
+                Expanded(child: Text(cabinOpen ? 'Door OPEN\nYou are inside your cabin' : 'Door CLOSED\nYou are not in your cabin',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: cabinOpen ? Colors.green.shade600 : Colors.red.shade600))),
+              ]),
               const SizedBox(height: 8),
-              Text('Opens by itself when you enter your cabin and closes when you leave. You can change it any time.',
+              Text('Automatic: inside your cabin = OPEN, away from it = CLOSED (about 15 seconds after you leave).',
                   style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant)),
             ]),
           ),
