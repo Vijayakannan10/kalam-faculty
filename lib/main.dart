@@ -450,7 +450,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Room? _room;                       // room the app has decided you are in
   Map<String, dynamic>? _me;         // your faculty record
   String? _problem;                  // permission / bluetooth message
-  bool _writing = false;
   DateTime? _lastWrite;
   StreamSubscription? _scanSub, _adapterSub, _meSub;
   Timer? _tick;
@@ -539,6 +538,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (FlutterBluePlus.isScanningNow) await FlutterBluePlus.stopScan();
       _scanStartedAt = DateTime.now();
       await FlutterBluePlus.startScan(
+        withNames: allBeaconNames(), // a filtered scan keeps working when the screen turns off
         continuousUpdates: true,
         androidScanMode: AndroidScanMode.lowLatency,
         androidUsesFineLocation: true,
@@ -601,12 +601,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       next = null; // away long enough: left the room
     }
 
-    final changed = next?.beaconName != _room?.beaconName;
     setState(() => _room = next);
-    if (changed) {
-      _push(next);
-    } else if (_room != null && (_lastWrite == null || now.difference(_lastWrite!) > heartbeat)) {
-      _push(_room, heartbeatOnly: true);
+    _sync(now);
+  }
+
+  // Every 2 seconds: make sure Firebase shows what the phone sees right now. If not, fix it.
+  void _sync(DateTime now) {
+    final me = _me;
+    if (me == null) return;
+    final room = _room;
+    final wantOpen = room != null && _isOwnCabin(room);
+    final wantStatus = room == null ? 'away' : (wantOpen ? 'cabin' : 'class');
+    final same = me['cabinOpen'] == wantOpen && me['status'] == wantStatus &&
+        (room == null || ((me['floor'] as num?)?.toInt() == room.floor && (me['idx'] as num?)?.toInt() == room.idx));
+    if (!same) {
+      _push(room);
+    } else if (room != null && (_lastWrite == null || now.difference(_lastWrite!) > heartbeat)) {
+      _push(room, heartbeatOnly: true);
     }
   }
 
@@ -644,9 +655,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _push(Room? room, {bool heartbeatOnly = false}) async {
-    if (_writing) return;
-    _writing = true;
     final now = DateTime.now();
+    if (_lastWrite != null && now.difference(_lastWrite!) < const Duration(seconds: 1)) return;
     final data = <String, dynamic>{'updatedAt': now.millisecondsSinceEpoch, 'source': 'beacon'};
     if (!heartbeatOnly) {
       if (room != null) {
@@ -658,14 +668,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         data['cabinOpen'] = false;
       }
     }
-    try {
-      await _doc.update(data);
-      _lastWrite = now;
-    } catch (_) {
-      // try again on the next change or heartbeat
-    } finally {
-      _writing = false;
-    }
+    _lastWrite = now;
+    // Don't wait for the server: Firebase queues the write and shows it locally at once.
+    // If it fails, _sync sees the difference and writes again.
+    _doc.update(data).catchError((_) {});
   }
 
   Future<void> _setCabin(bool open) async {

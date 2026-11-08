@@ -46,3 +46,20 @@ Room? parseBeacon(String name) {
 }
 
 int cabinIdx(String gender, int cabinNo) => gender == 'F' ? 4 + cabinNo : cabinNo;
+
+/// Every beacon name the 8th Block can have (6 floors × cabins, classrooms, lab, HOD).
+List<String> allBeaconNames() {
+  final names = <String>[];
+  for (var f = 1; f <= 6; f++) {
+    for (var n = 1; n <= 4; n++) {
+      names.add('KALAM-${f}G$n');
+      names.add('KALAM-${f}L$n');
+    }
+    for (var c = 1; c <= 10; c++) {
+      names.add('KALAM-$f${c.toString().padLeft(2, '0')}');
+    }
+    names.add('KALAM-${f}LAB1');
+    names.add('KALAM-${f}HOD');
+  }
+  return names;
+}
