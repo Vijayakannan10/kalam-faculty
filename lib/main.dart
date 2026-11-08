@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'firebase_config.dart';
 import 'rooms.dart';
@@ -36,6 +36,22 @@ Future<void> main() async {
       initError = 'Could not connect to Firebase.\n$e';
     }
   }
+  // Background mode: a small "Kalam Finder is running" notification keeps the app alive
+  // so the cabin door keeps updating while the phone is locked or in a pocket.
+  FlutterForegroundTask.init(
+    androidNotificationOptions: AndroidNotificationOptions(
+      channelId: 'kalam_finder',
+      channelName: 'Kalam Finder',
+      channelDescription: 'Keeps your cabin door status updated.',
+      channelImportance: NotificationChannelImportance.LOW,
+      priority: NotificationPriority.LOW,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(showNotification: false),
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.nothing(),
+      allowWakeLock: true,
+    ),
+  );
   runApp(KalamApp(initError: initError));
 }
 
@@ -460,7 +476,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    WakelockPlus.enable();
     WidgetsBinding.instance.addObserver(this);
     _meSub = _doc.snapshots().listen((s) {
       final oldFloor = _me?['cabinFloor'];
@@ -481,7 +496,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _adapterSub?.cancel();
     _meSub?.cancel();
     FlutterBluePlus.stopScan();
-    WakelockPlus.disable();
+    FlutterForegroundTask.stopService();
     super.dispose();
   }
 
@@ -496,8 +511,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() { _perms = statuses; _locationServiceOn = service; });
   }
 
+  bool _bgRunning = false;
+
+  Future<void> _startBackground() async {
+    try {
+      final np = await FlutterForegroundTask.checkNotificationPermission();
+      if (np != NotificationPermission.granted) {
+        await FlutterForegroundTask.requestNotificationPermission();
+      }
+      if (!await FlutterForegroundTask.isIgnoringBatteryOptimizations) {
+        await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+      }
+      if (!await FlutterForegroundTask.isRunningService) {
+        await FlutterForegroundTask.startService(
+          serviceId: 701,
+          notificationTitle: 'Kalam Finder is running',
+          notificationText: 'Your cabin door updates automatically. Do not swipe the app away.',
+        );
+      }
+      final running = await FlutterForegroundTask.isRunningService;
+      if (mounted) setState(() => _bgRunning = running);
+    } catch (_) {
+      if (mounted) setState(() => _bgRunning = false);
+    }
+  }
+
   Future<void> _start() async {
     await _checkPermissions();
+    await _startBackground();
 
     _adapterSub = FlutterBluePlus.adapterState.listen((state) async {
       if (state == BluetoothAdapterState.on) {
@@ -809,6 +850,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               Text('Nearby devices permission: ${permText(Permission.bluetoothScan)}'),
               Text('Location permission: ${permText(Permission.location)}'),
               Text('Location (GPS) switch: ${_locationServiceOn ? 'On' : 'Off'}'),
+              Text('Background mode: ${_bgRunning ? 'On (works with the phone locked)' : 'Off'}'),
               if (noResults) ...[
                 const SizedBox(height: 10),
                 const Text('No Kalam beacon heard right now. This is normal when you are away from your cabin. '
@@ -830,7 +872,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
         ),
         const SizedBox(height: 12),
-        Text('Keep this app open during college hours. Students see your room live.',
+        Text('You can lock the phone and keep it in your pocket. Just do not swipe the app away from recent apps.',
             textAlign: TextAlign.center, style: TextStyle(color: scheme.onSurfaceVariant)),
       ]),
     );

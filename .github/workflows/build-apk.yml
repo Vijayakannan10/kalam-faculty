@@ -30,10 +30,10 @@ jobs:
         run: python3 tool/patch_android.py
 
       - name: Get packages
-        run: flutter pub get
+        run: flutter pub get 2>&1 | tee pub.log
 
       - name: Build APK
-        run: flutter build apk --release
+        run: flutter build apk --release 2>&1 | tee build.log
 
       - uses: actions/upload-artifact@v4
         with:
@@ -47,3 +47,15 @@ jobs:
           name: Kalam Faculty ${{ github.run_number }}
           make_latest: true
           files: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish the error log if the build fails
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-log-${{ github.run_number }}
+          name: Build log ${{ github.run_number }} (failed)
+          prerelease: true
+          make_latest: false
+          files: |
+            build.log
+            pub.log

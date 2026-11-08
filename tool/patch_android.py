@@ -17,10 +17,22 @@ perms = """
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 """
 if "BLUETOOTH_SCAN" not in s:
     s = re.sub(r"(<manifest[^>]*>)", lambda m: m.group(1) + perms, s, count=1)
-s = re.sub(r'android:label="[^"]*"', 'android:label="Kalam Faculty"', s, count=1)
+s = re.sub(r'android:label="[^"]*"', 'android:label="Kalam Finder"', s, count=1)
+service = """        <service
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+    </application>"""
+if "flutter_foreground_task.service.ForegroundService" not in s:
+    s = s.replace("</application>", service, 1)
 manifest.write_text(s)
 print("Manifest patched")
 
