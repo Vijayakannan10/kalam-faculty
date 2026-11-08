@@ -99,6 +99,8 @@ class _StartScreenState extends State<StartScreen> {
     final prefs = await SharedPreferences.getInstance();
     final role = prefs.getString('role');
     final id = prefs.getString('facultyId');
+    // A faculty is registered on this phone: keep their cabin scan running whatever screen is open.
+    if (id != null) Presence.instance.start(id);
     if (!mounted) return;
     Widget next;
     if (role == 'student') {
@@ -218,14 +220,21 @@ class _StudentScreenState extends State<StudentScreen> {
         ],
       ),
       body: Column(children: [
-        if (widget.fromFaculty)
-          Container(
-            width: double.infinity,
-            color: scheme.secondaryContainer,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            child: Text('Student view. Your faculty scan keeps running in the background.',
-                style: TextStyle(color: scheme.onSecondaryContainer)),
-          ),
+        ListenableBuilder(
+          listenable: Presence.instance,
+          builder: (context, _) {
+            final pr = Presence.instance;
+            if (!pr.running) return const SizedBox.shrink();
+            final name = (pr.me?['name'] ?? 'faculty').toString();
+            return Container(
+              width: double.infinity,
+              color: scheme.secondaryContainer,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              child: Text('This phone is also reporting $name\'s cabin door, even while you are on this screen.',
+                  style: TextStyle(color: scheme.onSecondaryContainer)),
+            );
+          },
+        ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
           child: TextField(
@@ -444,63 +453,100 @@ class Seen {
   Seen(this.rssi, this.last);
 }
 
-class HomeScreen extends StatefulWidget {
-  final String facultyId;
-  const HomeScreen({super.key, required this.facultyId});
-  @override
-  State<HomeScreen> createState() => _HomeScreenState();
-}
+// The faculty scan runs here, outside any screen, so it keeps going on every screen
+// (student view, lock screen, other apps) for as long as a faculty is registered on this phone.
+class Presence extends ChangeNotifier with WidgetsBindingObserver {
+  Presence._();
+  static final Presence instance = Presence._();
 
-class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
-  final Map<String, Seen> _seen = {};
-  final Map<String, DateTime> _allDevices = {}; // every Bluetooth device the scan returns (for diagnosis)
-  Map<Permission, PermissionStatus> _perms = {};
-  bool _locationServiceOn = true;
-  DateTime? _scanStartedAt;
-  DateTime? _lastAnyResult;   // last time the scan returned anything at all
-  Room? _candidate;           // a room the phone hears strongly but has not confirmed yet
+  String? facultyId;
+  final Map<String, Seen> seen = {};
+  final Map<String, DateTime> allDevices = {}; // Kalam beacons the scan returned (for the phone check)
+  Map<Permission, PermissionStatus> perms = {};
+  bool locationServiceOn = true;
+  bool bgRunning = false;
+  DateTime? scanStartedAt;
+  DateTime? _lastAnyResult;
+  Room? _candidate;           // a cabin heard strongly but not confirmed yet
   DateTime? _candidateSince;
-  DateTime? _lastInRoom;      // last time the current room was clearly heard
-  Duration get _enterHold => enterHold;
-  Duration get _leaveHold => leaveHold;
-  Room? _room;                       // room the app has decided you are in
-  Map<String, dynamic>? _me;         // your faculty record
-  String? _problem;                  // permission / bluetooth message
+  DateTime? _lastInRoom;      // last time the current cabin was clearly heard
+  Room? room;                 // cabin the phone is in now (null = away)
+  Map<String, dynamic>? me;   // this faculty's record in Firebase
+  String? problem;
   DateTime? _lastWrite;
   StreamSubscription? _scanSub, _adapterSub, _meSub;
   Timer? _tick;
 
-  DocumentReference<Map<String, dynamic>> get _doc =>
-      FirebaseFirestore.instance.collection(facultyCollection).doc(widget.facultyId);
+  bool get running => facultyId != null;
 
-  @override
-  void initState() {
-    super.initState();
+  DocumentReference<Map<String, dynamic>> get _doc =>
+      FirebaseFirestore.instance.collection(facultyCollection).doc(facultyId);
+
+  Future<void> start(String id) async {
+    if (facultyId == id) return;
+    if (facultyId != null) await stop();
+    facultyId = id;
     WidgetsBinding.instance.addObserver(this);
-    _meSub = _doc.snapshots().listen((s) {
-      final oldFloor = _me?['cabinFloor'];
-      setState(() => _me = s.data());
-      if (_me?['cabinFloor'] != oldFloor && _scanStartedAt != null) {
-        Future.delayed(const Duration(seconds: 9), () { if (mounted) _startScan(force: true); });
+    _meSub = _doc.snapshots().listen((snap) {
+      final oldFloor = me?['cabinFloor'];
+      me = snap.data();
+      notifyListeners();
+      if (me?['cabinFloor'] != oldFloor && scanStartedAt != null) {
+        Future.delayed(const Duration(seconds: 9), () {
+          if (facultyId == id) startScan(force: true);
+        });
       }
     });
-    _start();
     _tick = Timer.periodic(const Duration(seconds: 2), (_) => _evaluate());
+    await checkPermissions();
+    await _startBackground();
+    _adapterSub = FlutterBluePlus.adapterState.listen((state) async {
+      if (state == BluetoothAdapterState.on) {
+        problem = null;
+        notifyListeners();
+        await startScan();
+      } else {
+        problem = 'Turn on Bluetooth to detect your cabin.';
+        notifyListeners();
+      }
+    });
+    try { await FlutterBluePlus.turnOn(); } catch (_) {}
   }
 
-  @override
-  void dispose() {
+  Future<void> stop() async {
+    if (facultyId != null) {
+      // signing out of this phone: show the door as closed
+      try {
+        _doc.update({'status': 'away', 'cabinOpen': false, 'updatedAt': DateTime.now().millisecondsSinceEpoch}).catchError((_) {});
+      } catch (_) {}
+    }
     WidgetsBinding.instance.removeObserver(this);
     _tick?.cancel();
-    _scanSub?.cancel();
-    _adapterSub?.cancel();
-    _meSub?.cancel();
-    FlutterBluePlus.stopScan();
-    FlutterForegroundTask.stopService();
-    super.dispose();
+    _tick = null;
+    await _scanSub?.cancel();
+    await _adapterSub?.cancel();
+    await _meSub?.cancel();
+    _scanSub = null;
+    _adapterSub = null;
+    _meSub = null;
+    try { await FlutterBluePlus.stopScan(); } catch (_) {}
+    try { await FlutterForegroundTask.stopService(); } catch (_) {}
+    facultyId = null;
+    me = null;
+    room = null;
+    _candidate = null;
+    _candidateSince = null;
+    _lastInRoom = null;
+    seen.clear();
+    allDevices.clear();
+    scanStartedAt = null;
+    _lastAnyResult = null;
+    bgRunning = false;
+    problem = null;
+    notifyListeners();
   }
 
-  Future<void> _checkPermissions() async {
+  Future<void> checkPermissions() async {
     final statuses = await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
@@ -508,10 +554,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     ].request();
     bool service = true;
     try { service = await Permission.location.serviceStatus.isEnabled; } catch (_) {}
-    setState(() { _perms = statuses; _locationServiceOn = service; });
+    perms = statuses;
+    locationServiceOn = service;
+    notifyListeners();
   }
-
-  bool _bgRunning = false;
 
   Future<void> _startBackground() async {
     try {
@@ -529,36 +575,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           notificationText: 'Your cabin door updates automatically. Do not swipe the app away.',
         );
       }
-      final running = await FlutterForegroundTask.isRunningService;
-      if (mounted) setState(() => _bgRunning = running);
+      bgRunning = await FlutterForegroundTask.isRunningService;
     } catch (_) {
-      if (mounted) setState(() => _bgRunning = false);
+      bgRunning = false;
     }
-  }
-
-  Future<void> _start() async {
-    await _checkPermissions();
-    await _startBackground();
-
-    _adapterSub = FlutterBluePlus.adapterState.listen((state) async {
-      if (state == BluetoothAdapterState.on) {
-        setState(() => _problem = null);
-        await _startScan();
-      } else {
-        setState(() => _problem = 'Turn on Bluetooth to detect your room.');
-      }
-    });
-    try { await FlutterBluePlus.turnOn(); } catch (_) {}
+    notifyListeners();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // Android often stops the scan when the screen turns off or the app goes to the background.
-    if (state == AppLifecycleState.resumed) _startScan(force: true);
+    if (state == AppLifecycleState.resumed && running) startScan(force: true);
   }
 
-  Future<void> _startScan({bool force = false}) async {
-    final started = _scanStartedAt;
+  Future<void> startScan({bool force = false}) async {
+    if (!running) return;
+    final started = scanStartedAt;
     // Android blocks apps that start scans too often (5 per 30 s), so never restart faster than every 8 s.
     if (started != null && DateTime.now().difference(started) < const Duration(seconds: 8)) return;
     if (!force && started != null && FlutterBluePlus.isScanningNow) return;
@@ -567,23 +599,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final now = DateTime.now();
       if (results.isNotEmpty) _lastAnyResult = now;
       for (final r in results) {
-        _allDevices[r.device.remoteId.str] = now;
+        allDevices[r.device.remoteId.str] = now;
         String name = r.advertisementData.advName;
         if (name.isEmpty) name = r.device.platformName;
         if (name.isEmpty) name = r.device.advName;
         if (!name.toUpperCase().startsWith('KALAM-')) continue;
-        final s = _seen[name];
+        final s = seen[name];
         if (s == null) {
-          _seen[name] = Seen(r.rssi.toDouble(), now);
+          seen[name] = Seen(r.rssi.toDouble(), now);
         } else {
           s.rssi = s.rssi * 0.7 + r.rssi * 0.3; // smooth the jumpy signal
           s.last = now;
         }
       }
-    }, onError: (e) => setState(() => _problem = 'Bluetooth scan error: $e'));
+    }, onError: (e) {
+      problem = 'Bluetooth scan error: $e';
+      notifyListeners();
+    });
     try {
       if (FlutterBluePlus.isScanningNow) await FlutterBluePlus.stopScan();
-      _scanStartedAt = DateTime.now();
+      scanStartedAt = DateTime.now();
       await FlutterBluePlus.startScan(
         withNames: _scanNames(), // a filtered scan keeps working when the screen turns off
         continuousUpdates: true,
@@ -591,42 +626,44 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         androidUsesFineLocation: true,
       );
     } catch (e) {
-      setState(() => _problem = 'Could not start Bluetooth scan: $e');
+      problem = 'Could not start Bluetooth scan: $e';
+      notifyListeners();
     }
   }
 
   void _evaluate() {
+    if (!running) return;
     final now = DateTime.now();
 
     // Watchdog: if the scan has gone silent, restart it (Android stops scans without telling the app).
     final scanAlive = _lastAnyResult != null && now.difference(_lastAnyResult!) < const Duration(seconds: 12);
-    final started = _scanStartedAt;
+    final started = scanStartedAt;
     if (FlutterBluePlus.adapterStateNow == BluetoothAdapterState.on && started != null) {
-      if (!scanAlive && now.difference(started) > const Duration(seconds: 20)) _startScan(force: true);
-      if (now.difference(started) > const Duration(minutes: 10)) _startScan(force: true); // regular refresh
+      if (!scanAlive && now.difference(started) > const Duration(seconds: 20)) startScan(force: true);
+      if (now.difference(started) > const Duration(minutes: 10)) startScan(force: true); // regular refresh
     }
-    _seen.removeWhere((_, s) => now.difference(s.last) > const Duration(minutes: 2));
+    seen.removeWhere((_, s) => now.difference(s.last) > const Duration(minutes: 2));
 
-    // strongest room the phone hears right now
+    // strongest cabin the phone hears right now
     MapEntry<String, Seen>? best;
-    for (final e in _seen.entries) {
+    for (final e in seen.entries) {
       if (now.difference(e.value.last) > lostAfter) continue;
       if (parseBeacon(e.key) == null) continue;
       if (best == null || e.value.rssi > best.value.rssi) best = e;
     }
 
-    // is the current room still clearly heard?
+    // is the current cabin still clearly heard?
     Seen? cur;
     bool curOk = false;
-    if (_room != null) {
-      cur = _seen[_room!.beaconName];
+    if (room != null) {
+      cur = seen[room!.beaconName];
       curOk = cur != null && now.difference(cur.last) <= lostAfter && cur.rssi >= leaveRssi;
       if (curOk) _lastInRoom = now;
     }
 
-    // a different room heard strongly becomes a candidate; it must stay that way for the enter time
+    // a different cabin heard strongly becomes a candidate; it must stay that way for a few seconds
     Room? cand;
-    if (best != null && best.value.rssi >= enterRssi && best.key != _room?.beaconName) {
+    if (best != null && best.value.rssi >= enterRssi && best.key != room?.beaconName) {
       final muchStronger = !curOk || best.value.rssi > cur!.rssi + switchMargin;
       if (muchStronger) cand = parseBeacon(best.key);
     }
@@ -638,57 +675,50 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _candidateSince = now;
     }
 
-    Room? next = _room;
-    if (_candidate != null && now.difference(_candidateSince!) >= _enterHold) {
-      next = _candidate;
+    if (_candidate != null && now.difference(_candidateSince!) >= enterHold) {
+      room = _candidate;
       _lastInRoom = now;
       _candidate = null;
       _candidateSince = null;
-    } else if (_room != null && _lastInRoom != null && now.difference(_lastInRoom!) >= _leaveHold) {
-      next = null; // away long enough: left the room
+    } else if (room != null && _lastInRoom != null && now.difference(_lastInRoom!) >= leaveHold) {
+      room = null; // away: left the cabin
     }
 
-    setState(() => _room = next);
     _sync(now);
+    notifyListeners();
   }
 
   // Every 2 seconds: make sure Firebase shows what the phone sees right now. If not, fix it.
   void _sync(DateTime now) {
-    final me = _me;
-    if (me == null) return;
-    final room = _room;
-    final wantOpen = room != null && _isOwnCabin(room);
-    final wantStatus = room == null ? 'away' : (wantOpen ? 'cabin' : 'class');
-    final same = me['cabinOpen'] == wantOpen && me['status'] == wantStatus &&
-        (room == null || ((me['floor'] as num?)?.toInt() == room.floor && (me['idx'] as num?)?.toInt() == room.idx));
+    final m = me;
+    if (m == null) return;
+    final r = room;
+    final wantOpen = r != null && isOwnCabin(r);
+    final wantStatus = r == null ? 'away' : (wantOpen ? 'cabin' : 'class');
+    final same = m['cabinOpen'] == wantOpen && m['status'] == wantStatus &&
+        (r == null || ((m['floor'] as num?)?.toInt() == r.floor && (m['idx'] as num?)?.toInt() == r.idx));
     if (!same) {
-      _push(room);
-    } else if (room != null && (_lastWrite == null || now.difference(_lastWrite!) > heartbeat)) {
-      _push(room, heartbeatOnly: true);
+      _push(r);
+    } else if (r != null && (_lastWrite == null || now.difference(_lastWrite!) > heartbeat)) {
+      _push(r, heartbeatOnly: true);
     }
-  }
-
-  String _fmt(Duration d) {
-    if (d.isNegative) return '0:00';
-    final m = d.inMinutes, sec = d.inSeconds % 60;
-    return '$m:${sec.toString().padLeft(2, '0')}';
   }
 
   // Listen only for the cabins on your own floor (8 names). Android keeps a filtered scan running
   // when the screen is off, and a short list fits in every phone's Bluetooth chip.
   List<String> _scanNames() {
-    final f = (_me?['cabinFloor'] as num?)?.toInt();
+    final f = (me?['cabinFloor'] as num?)?.toInt();
     if (f == null) return [];
     return [for (final side in ['G', 'L']) for (var n = 1; n <= 4; n++) 'KALAM-$f$side$n'];
   }
 
-  String _myCabinLabel() {
-    final me = _me;
-    if (me == null) return 'not set';
-    return 'Floor ${me['cabinFloor']}, ${me['gender'] == 'F' ? 'L' : 'G'}${me['cabinNo']}';
+  String myCabinLabel() {
+    final m = me;
+    if (m == null) return 'not set';
+    return 'Floor ${m['cabinFloor']}, ${m['gender'] == 'F' ? 'L' : 'G'}${m['cabinNo']}';
   }
 
-  Future<void> _makeMyCabin(Room r) async {
+  Future<void> makeMyCabin(Room r) async {
     final gents = r.idx <= 4;
     try {
       await _doc.update({
@@ -702,21 +732,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
-  bool _isOwnCabin(Room r) {
-    final me = _me;
-    if (me == null) return false;
-    return r.floor == (me['cabinFloor'] as num?)?.toInt() &&
-        r.idx == cabinIdx(me['gender'] ?? 'M', (me['cabinNo'] as num?)?.toInt() ?? 0);
+  bool isOwnCabin(Room r) {
+    final m = me;
+    if (m == null) return false;
+    return r.floor == (m['cabinFloor'] as num?)?.toInt() &&
+        r.idx == cabinIdx(m['gender'] ?? 'M', (m['cabinNo'] as num?)?.toInt() ?? 0);
   }
 
-  Future<void> _push(Room? room, {bool heartbeatOnly = false}) async {
+  void _push(Room? r, {bool heartbeatOnly = false}) {
     final now = DateTime.now();
     if (_lastWrite != null && now.difference(_lastWrite!) < const Duration(seconds: 1)) return;
     final data = <String, dynamic>{'updatedAt': now.millisecondsSinceEpoch, 'source': 'beacon'};
     if (!heartbeatOnly) {
-      if (room != null) {
-        final own = _isOwnCabin(room);
-        data.addAll({'status': own ? 'cabin' : 'class', 'floor': room.floor, 'idx': room.idx});
+      if (r != null) {
+        final own = isOwnCabin(r);
+        data.addAll({'status': own ? 'cabin' : 'class', 'floor': r.floor, 'idx': r.idx});
         data['cabinOpen'] = own; // door is open only when you are in your own cabin
       } else {
         data['status'] = 'away';
@@ -728,12 +758,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // If it fails, _sync sees the difference and writes again.
     _doc.update(data).catchError((_) {});
   }
+}
 
-  Future<void> _setCabin(bool open) async {
-    try { await _doc.update({'cabinOpen': open, 'updatedAt': DateTime.now().millisecondsSinceEpoch}); } catch (_) {}
+class HomeScreen extends StatefulWidget {
+  final String facultyId;
+  const HomeScreen({super.key, required this.facultyId});
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final Presence p = Presence.instance;
+
+  @override
+  void initState() {
+    super.initState();
+    p.start(widget.facultyId); // does nothing if it is already running for this faculty
   }
 
   Future<void> _logout() async {
+    await p.stop();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('facultyId');
     await prefs.remove('role');
@@ -742,17 +786,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => ListenableBuilder(listenable: p, builder: (context, _) => _body(context));
+
+  Widget _body(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final me = _me;
+    final me = p.me;
     final cabinOpen = me?['cabinOpen'] == true;
-    final nearby = _seen.entries.toList()..sort((a, b) => b.value.rssi.compareTo(a.value.rssi));
+    final nearby = p.seen.entries.toList()..sort((a, b) => b.value.rssi.compareTo(a.value.rssi));
     final now = DateTime.now();
-    final deviceCount = _allDevices.values.where((t) => now.difference(t) < const Duration(seconds: 30)).length;
-    final scanAge = _scanStartedAt == null ? Duration.zero : now.difference(_scanStartedAt!);
+    final deviceCount = p.allDevices.values.where((t) => now.difference(t) < const Duration(seconds: 30)).length;
+    final scanAge = p.scanStartedAt == null ? Duration.zero : now.difference(p.scanStartedAt!);
     final noResults = deviceCount == 0 && scanAge > const Duration(seconds: 10);
-    String permText(Permission p) {
-      final st = _perms[p];
+    String permText(Permission perm) {
+      final st = p.perms[perm];
       if (st == null) return 'checking…';
       if (st.isGranted || st.isLimited) return 'Allowed';
       return st.isPermanentlyDenied ? 'Blocked' : 'Not allowed';
@@ -770,30 +816,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ],
       ),
       body: ListView(padding: const EdgeInsets.all(16), children: [
-        if (_problem != null)
-          Card(color: scheme.errorContainer, child: Padding(padding: const EdgeInsets.all(16), child: Text(_problem!, style: TextStyle(color: scheme.onErrorContainer)))),
+        if (p.problem != null)
+          Card(color: scheme.errorContainer, child: Padding(padding: const EdgeInsets.all(16), child: Text(p.problem!, style: TextStyle(color: scheme.onErrorContainer)))),
         Card(
           child: Padding(
             padding: const EdgeInsets.all(20),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text('YOU ARE IN', style: TextStyle(fontSize: 12, letterSpacing: 1.2, color: scheme.onSurfaceVariant)),
               const SizedBox(height: 6),
-              Text(_room?.fullLabel ?? 'Not in any room', style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w700)),
+              Text(p.room?.fullLabel ?? 'Not in any room', style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w700)),
               const SizedBox(height: 6),
-              Text(_room == null
+              Text(p.room == null
                   ? 'You are away from your cabin beacon.'
-                  : (_isOwnCabin(_room!) ? 'This is your cabin.' : 'This is not your saved cabin.'),
+                  : (p.isOwnCabin(p.room!) ? 'This is your cabin.' : 'This is not your saved cabin.'),
                   style: TextStyle(color: scheme.onSurfaceVariant)),
-              if (_room != null && !_isOwnCabin(_room!) && _room!.idx <= 8) ...[
+              if (p.room != null && !p.isOwnCabin(p.room!) && p.room!.idx <= 8) ...[
                 const SizedBox(height: 10),
-                Text('Your saved cabin is ${_myCabinLabel()}, so students see your door CLOSED. '
+                Text('Your saved cabin is ${p.myCabinLabel()}, so students see your door CLOSED. '
                     'If this room is your cabin, tap below.',
                     style: TextStyle(color: scheme.error, fontWeight: FontWeight.w600)),
                 const SizedBox(height: 8),
                 FilledButton.icon(
-                  onPressed: () => _makeMyCabin(_room!),
+                  onPressed: () => p.makeMyCabin(p.room!),
                   icon: const Icon(Icons.check),
-                  label: Text('Make ${_room!.label} my cabin'),
+                  label: Text('Make ${p.room!.label} my cabin'),
                 ),
               ],
             ]),
@@ -849,8 +895,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               Text('Kalam beacons heard: $deviceCount'),
               Text('Nearby devices permission: ${permText(Permission.bluetoothScan)}'),
               Text('Location permission: ${permText(Permission.location)}'),
-              Text('Location (GPS) switch: ${_locationServiceOn ? 'On' : 'Off'}'),
-              Text('Background mode: ${_bgRunning ? 'On (works with the phone locked)' : 'Off'}'),
+              Text('Location (GPS) switch: ${p.locationServiceOn ? 'On' : 'Off'}'),
+              Text('Background mode: ${p.bgRunning ? 'On (works with the phone locked)' : 'Off'}'),
               if (noResults) ...[
                 const SizedBox(height: 10),
                 const Text('No Kalam beacon heard right now. This is normal when you are away from your cabin. '
@@ -860,7 +906,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               const SizedBox(height: 4),
               Wrap(spacing: 8, runSpacing: 8, children: [
                 FilledButton.icon(
-                  onPressed: () async { await _checkPermissions(); await _startScan(force: true); },
+                  onPressed: () async { await p.checkPermissions(); await p.startScan(force: true); },
                   icon: const Icon(Icons.refresh), label: const Text('Scan again'),
                 ),
                 OutlinedButton.icon(
