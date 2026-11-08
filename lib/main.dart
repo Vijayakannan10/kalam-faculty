@@ -81,15 +81,199 @@ class _StartScreenState extends State<StartScreen> {
 
   Future<void> _check() async {
     final prefs = await SharedPreferences.getInstance();
+    final role = prefs.getString('role');
     final id = prefs.getString('facultyId');
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(MaterialPageRoute(
-      builder: (_) => id == null ? const PickFacultyScreen() : HomeScreen(facultyId: id),
-    ));
+    Widget next;
+    if (role == 'student') {
+      next = const StudentScreen();
+    } else if (role == 'faculty' && id != null) {
+      next = HomeScreen(facultyId: id);
+    } else {
+      next = const RoleScreen();
+    }
+    Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => next));
   }
 
   @override
   Widget build(BuildContext context) => const Scaffold(body: Center(child: CircularProgressIndicator()));
+}
+
+// ---------------- Role: student or faculty ----------------
+class RoleScreen extends StatelessWidget {
+  const RoleScreen({super.key});
+
+  Future<void> _pick(BuildContext context, String role) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('role', role);
+    if (!context.mounted) return;
+    final id = prefs.getString('facultyId');
+    Navigator.of(context).pushReplacement(MaterialPageRoute(
+      builder: (_) => role == 'student'
+          ? const StudentScreen()
+          : (id != null ? HomeScreen(facultyId: id) : const PickFacultyScreen()),
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    Widget option(IconData icon, String title, String sub, String role) => Card(
+          child: InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: () => _pick(context, role),
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Row(children: [
+                Icon(icon, size: 40, color: scheme.primary),
+                const SizedBox(width: 16),
+                Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(title, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 4),
+                  Text(sub, style: TextStyle(color: scheme.onSurfaceVariant)),
+                ])),
+              ]),
+            ),
+          ),
+        );
+    return Scaffold(
+      appBar: AppBar(title: const Text('Kalam Finder')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        const Text('8th Block · Abdul Kalam Block', style: TextStyle(fontSize: 13)),
+        const SizedBox(height: 12),
+        option(Icons.school, "I'm a student", 'See which faculty are in their cabin right now.', 'student'),
+        const SizedBox(height: 8),
+        option(Icons.badge, "I'm faculty", 'Keep this app open. Your cabin door shows Open when you are inside.', 'faculty'),
+      ]),
+    );
+  }
+}
+
+// ---------------- Student view: who is in their cabin ----------------
+class StudentScreen extends StatefulWidget {
+  final bool fromFaculty;
+  const StudentScreen({super.key, this.fromFaculty = false});
+  @override
+  State<StudentScreen> createState() => _StudentScreenState();
+}
+
+class _StudentScreenState extends State<StudentScreen> {
+  final _search = TextEditingController();
+  Timer? _clock;
+
+  @override
+  void initState() {
+    super.initState();
+    _clock = Timer.periodic(const Duration(seconds: 30), (_) => setState(() {})); // refresh "updated … ago"
+  }
+
+  @override
+  void dispose() {
+    _clock?.cancel();
+    _search.dispose();
+    super.dispose();
+  }
+
+  String _ago(int? ms) {
+    if (ms == null) return 'never updated';
+    final m = DateTime.now().difference(DateTime.fromMillisecondsSinceEpoch(ms)).inMinutes;
+    if (m < 1) return 'updated just now';
+    if (m < 60) return 'updated $m min ago';
+    if (m < 1440) return 'updated ${m ~/ 60} hr ago';
+    return 'updated ${m ~/ 1440} days ago';
+  }
+
+  Future<void> _switchRole() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('role');
+    if (!mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const RoleScreen()), (_) => false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Find faculty'),
+        actions: [
+          if (!widget.fromFaculty)
+            IconButton(onPressed: _switchRole, icon: const Icon(Icons.swap_horiz), tooltip: 'Switch to faculty'),
+        ],
+      ),
+      body: Column(children: [
+        if (widget.fromFaculty)
+          Container(
+            width: double.infinity,
+            color: scheme.secondaryContainer,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            child: Text('Student view. Your faculty scan keeps running in the background.',
+                style: TextStyle(color: scheme.onSecondaryContainer)),
+          ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+          child: TextField(
+            controller: _search,
+            onChanged: (_) => setState(() {}),
+            decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: 'Search faculty name', border: OutlineInputBorder()),
+          ),
+        ),
+        Expanded(
+          child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: FirebaseFirestore.instance.collection(facultyCollection).orderBy('name').snapshots(),
+            builder: (context, snap) {
+              if (snap.hasError) return Center(child: Text('Could not load faculty.\n${snap.error}', textAlign: TextAlign.center));
+              if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+              final q = _search.text.trim().toLowerCase();
+              final docs = snap.data!.docs.where((d) => (d.data()['name'] ?? '').toString().toLowerCase().contains(q)).toList();
+              if (docs.isEmpty) return const Center(child: Text('No faculty found.'));
+              final inCount = snap.data!.docs.where((d) => d.data()['cabinOpen'] == true).length;
+              return ListView(padding: const EdgeInsets.fromLTRB(16, 8, 16, 24), children: [
+                Text('$inCount of ${snap.data!.docs.length} faculty in their cabin now',
+                    style: TextStyle(color: scheme.onSurfaceVariant)),
+                const SizedBox(height: 8),
+                for (final d in docs) _card(d.data(), scheme),
+              ]);
+            },
+          ),
+        ),
+      ]),
+    );
+  }
+
+  Widget _card(Map<String, dynamic> f, ColorScheme scheme) {
+    final open = f['cabinOpen'] == true;
+    final gender = f['gender'] == 'F' ? 'L' : 'G';
+    final cabin = 'Floor ${f['cabinFloor']} · Cabin $gender${f['cabinNo']}';
+    final green = Colors.green.shade600, red = Colors.red.shade600;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(children: [
+          CircleAvatar(radius: 24, child: Text(_initials((f['name'] ?? '?').toString()))),
+          const SizedBox(width: 14),
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text((f['name'] ?? 'Faculty').toString(), style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 2),
+            Text(cabin, style: TextStyle(color: scheme.onSurfaceVariant)),
+            const SizedBox(height: 2),
+            Text(_ago((f['updatedAt'] as num?)?.toInt()), style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
+          ])),
+          const SizedBox(width: 8),
+          Column(children: [
+            Icon(open ? Icons.meeting_room : Icons.door_front_door, color: open ? green : red, size: 30),
+            const SizedBox(height: 4),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(color: (open ? green : red).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
+              child: Text(open ? 'Open · Inside' : 'Closed · Out',
+                  style: TextStyle(color: open ? green : red, fontWeight: FontWeight.w700, fontSize: 12)),
+            ),
+          ]),
+        ]),
+      ),
+    );
+  }
 }
 
 class PickFacultyScreen extends StatelessWidget {
@@ -98,6 +282,7 @@ class PickFacultyScreen extends StatelessWidget {
   Future<void> _choose(BuildContext context, String id) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('facultyId', id);
+    await prefs.setString('role', 'faculty');
     if (!context.mounted) return;
     Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => HomeScreen(facultyId: id)));
   }
@@ -462,8 +647,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _logout() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('facultyId');
+    await prefs.remove('role');
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const PickFacultyScreen()));
+    Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const RoleScreen()));
   }
 
   @override
@@ -486,7 +672,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Scaffold(
       appBar: AppBar(
         title: Text(me?['name'] ?? 'Kalam Faculty'),
-        actions: [IconButton(onPressed: _logout, icon: const Icon(Icons.switch_account), tooltip: 'Change faculty')],
+        actions: [
+          IconButton(
+            onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const StudentScreen(fromFaculty: true))),
+            icon: const Icon(Icons.visibility), tooltip: 'Student view',
+          ),
+          IconButton(onPressed: _logout, icon: const Icon(Icons.switch_account), tooltip: 'Change faculty'),
+        ],
       ),
       body: ListView(padding: const EdgeInsets.all(16), children: [
         if (_problem != null)
