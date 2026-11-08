@@ -462,7 +462,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WakelockPlus.enable();
     WidgetsBinding.instance.addObserver(this);
-    _meSub = _doc.snapshots().listen((s) => setState(() => _me = s.data()));
+    _meSub = _doc.snapshots().listen((s) {
+      final oldFloor = _me?['cabinFloor'];
+      setState(() => _me = s.data());
+      if (_me?['cabinFloor'] != oldFloor && _scanStartedAt != null) {
+        Future.delayed(const Duration(seconds: 9), () { if (mounted) _startScan(force: true); });
+      }
+    });
     _start();
     _tick = Timer.periodic(const Duration(seconds: 2), (_) => _evaluate());
   }
@@ -538,7 +544,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (FlutterBluePlus.isScanningNow) await FlutterBluePlus.stopScan();
       _scanStartedAt = DateTime.now();
       await FlutterBluePlus.startScan(
-        withNames: allBeaconNames(), // a filtered scan keeps working when the screen turns off
+        withNames: _scanNames(), // a filtered scan keeps working when the screen turns off
         continuousUpdates: true,
         androidScanMode: AndroidScanMode.lowLatency,
         androidUsesFineLocation: true,
@@ -625,6 +631,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (d.isNegative) return '0:00';
     final m = d.inMinutes, sec = d.inSeconds % 60;
     return '$m:${sec.toString().padLeft(2, '0')}';
+  }
+
+  // Listen only for the cabins on your own floor (8 names). Android keeps a filtered scan running
+  // when the screen is off, and a short list fits in every phone's Bluetooth chip.
+  List<String> _scanNames() {
+    final f = (_me?['cabinFloor'] as num?)?.toInt();
+    if (f == null) return [];
+    return [for (final side in ['G', 'L']) for (var n = 1; n <= 4; n++) 'KALAM-$f$side$n'];
   }
 
   String _myCabinLabel() {
@@ -791,15 +805,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text('PHONE CHECK', style: TextStyle(fontSize: 12, letterSpacing: 1.2, color: scheme.onSurfaceVariant)),
               const SizedBox(height: 8),
-              Text('Bluetooth devices seen: $deviceCount'),
+              Text('Kalam beacons heard: $deviceCount'),
               Text('Nearby devices permission: ${permText(Permission.bluetoothScan)}'),
               Text('Location permission: ${permText(Permission.location)}'),
               Text('Location (GPS) switch: ${_locationServiceOn ? 'On' : 'Off'}'),
               if (noResults) ...[
                 const SizedBox(height: 10),
-                const Text('No Bluetooth results right now. The app restarts the scan by itself every 20 seconds. '
-                    'If this stays red for over a minute, close the app fully, wait 30 seconds and open it again. '
-                    'Also check that Location is on and "Nearby devices" is allowed.'),
+                const Text('No Kalam beacon heard right now. This is normal when you are away from your cabin. '
+                    'If you are inside your cabin and this stays red for over a minute, close the app fully, '
+                    'wait 30 seconds and open it again.'),
               ],
               const SizedBox(height: 4),
               Wrap(spacing: 8, runSpacing: 8, children: [
