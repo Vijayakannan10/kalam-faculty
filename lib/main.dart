@@ -240,6 +240,10 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final Map<String, Seen> _seen = {};
+  final Map<String, DateTime> _allDevices = {}; // every Bluetooth device the scan returns (for diagnosis)
+  Map<Permission, PermissionStatus> _perms = {};
+  bool _locationServiceOn = true;
+  DateTime? _scanStartedAt;
   Room? _room;                       // room the app has decided you are in
   Map<String, dynamic>? _me;         // your faculty record
   String? _problem;                  // permission / bluetooth message
@@ -271,17 +275,19 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
-  Future<void> _start() async {
+  Future<void> _checkPermissions() async {
     final statuses = await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
-      Permission.locationWhenInUse,
+      Permission.location,
     ].request();
-    final denied = statuses.entries.where((e) => e.value.isPermanentlyDenied || e.value.isDenied).map((e) => e.key).toList();
-    if (denied.contains(Permission.bluetoothScan) && denied.contains(Permission.locationWhenInUse)) {
-      setState(() => _problem = 'Allow Bluetooth and Location for this app in phone Settings, then reopen it.');
-      return;
-    }
+    bool service = true;
+    try { service = await Permission.location.serviceStatus.isEnabled; } catch (_) {}
+    setState(() { _perms = statuses; _locationServiceOn = service; });
+  }
+
+  Future<void> _start() async {
+    await _checkPermissions();
 
     _adapterSub = FlutterBluePlus.adapterState.listen((state) async {
       if (state == BluetoothAdapterState.on) {
@@ -299,7 +305,10 @@ class _HomeScreenState extends State<HomeScreen> {
     _scanSub = FlutterBluePlus.onScanResults.listen((results) {
       final now = DateTime.now();
       for (final r in results) {
-        final name = r.advertisementData.advName.isNotEmpty ? r.advertisementData.advName : r.device.platformName;
+        _allDevices[r.device.remoteId.str] = now;
+        String name = r.advertisementData.advName;
+        if (name.isEmpty) name = r.device.platformName;
+        if (name.isEmpty) name = r.device.advName;
         if (!name.toUpperCase().startsWith('KALAM-')) continue;
         final s = _seen[name];
         if (s == null) {
@@ -309,9 +318,15 @@ class _HomeScreenState extends State<HomeScreen> {
           s.last = now;
         }
       }
-    });
+    }, onError: (e) => setState(() => _problem = 'Bluetooth scan error: $e'));
     try {
-      await FlutterBluePlus.startScan(continuousUpdates: true, androidScanMode: AndroidScanMode.lowLatency);
+      if (FlutterBluePlus.isScanningNow) await FlutterBluePlus.stopScan();
+      _scanStartedAt = DateTime.now();
+      await FlutterBluePlus.startScan(
+        continuousUpdates: true,
+        androidScanMode: AndroidScanMode.lowLatency,
+        androidUsesFineLocation: true,
+      );
     } catch (e) {
       setState(() => _problem = 'Could not start Bluetooth scan: $e');
     }
@@ -401,6 +416,16 @@ class _HomeScreenState extends State<HomeScreen> {
     final me = _me;
     final cabinOpen = me?['cabinOpen'] == true;
     final nearby = _seen.entries.toList()..sort((a, b) => b.value.rssi.compareTo(a.value.rssi));
+    final now = DateTime.now();
+    final deviceCount = _allDevices.values.where((t) => now.difference(t) < const Duration(seconds: 30)).length;
+    final scanAge = _scanStartedAt == null ? Duration.zero : now.difference(_scanStartedAt!);
+    final noResults = deviceCount == 0 && scanAge > const Duration(seconds: 10);
+    String permText(Permission p) {
+      final st = _perms[p];
+      if (st == null) return 'checking…';
+      if (st.isGranted || st.isLimited) return 'Allowed';
+      return st.isPermanentlyDenied ? 'Blocked' : 'Not allowed';
+    }
 
     return Scaffold(
       appBar: AppBar(
@@ -462,6 +487,37 @@ class _HomeScreenState extends State<HomeScreen> {
                   subtitle: Text(e.key),
                   trailing: Text('${e.value.rssi.round()} dBm', style: const TextStyle(fontFeatures: [FontFeature.tabularFigures()])),
                 ),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Card(
+          color: noResults ? scheme.errorContainer : null,
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('PHONE CHECK', style: TextStyle(fontSize: 12, letterSpacing: 1.2, color: scheme.onSurfaceVariant)),
+              const SizedBox(height: 8),
+              Text('Bluetooth devices seen: $deviceCount'),
+              Text('Nearby devices permission: ${permText(Permission.bluetoothScan)}'),
+              Text('Location permission: ${permText(Permission.location)}'),
+              Text('Location (GPS) switch: ${_locationServiceOn ? 'On' : 'Off'}'),
+              if (noResults) ...[
+                const SizedBox(height: 10),
+                const Text('The phone is not giving any Bluetooth results to this app. '
+                    'Turn on Location, then in App settings allow "Nearby devices" and Location with "Use precise location" on.'),
+              ],
+              const SizedBox(height: 12),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                FilledButton.icon(
+                  onPressed: () async { await _checkPermissions(); await _startScan(); },
+                  icon: const Icon(Icons.refresh), label: const Text('Scan again'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () => openAppSettings(),
+                  icon: const Icon(Icons.settings), label: const Text('App settings'),
+                ),
+              ]),
             ]),
           ),
         ),
