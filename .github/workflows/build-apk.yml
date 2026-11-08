@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -36,3 +39,11 @@ jobs:
         with:
           name: kalam-faculty-apk
           path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish APK as a download link
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Kalam Faculty ${{ github.run_number }}
+          make_latest: true
+          files: build/app/outputs/flutter-apk/app-release.apk
