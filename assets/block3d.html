@@ -1,0 +1,290 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Abdul Kalam Block</title>
+<style>
+:root{
+  --bg:#eef1f6; --panel:#ffffff; --fg:#18202e; --muted:#5b6578; --line:#d8dce6;
+  --open:#17834a; --open-bg:#e3f4ea; --closed:#c03a2b; --closed-bg:#fbe7e4; --accent:#2b4fb8;
+}
+@media (prefers-color-scheme: dark){:root{
+  --bg:#11151d; --panel:#1b2230; --fg:#e7ebf3; --muted:#9aa4b8; --line:#2d3546;
+  --open:#4fd08a; --open-bg:#16301f; --closed:#ff7a6b; --closed-bg:#3a1c19; --accent:#7d9bff;
+}}
+[hidden]{display:none!important}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden;-webkit-tap-highlight-color:transparent}
+#stage{position:fixed;inset:0}
+#stage canvas{display:block;width:100%;height:100%;touch-action:none}
+.top{position:fixed;left:0;right:0;top:0;padding:10px 12px 0;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.chips{display:flex;gap:6px;overflow-x:auto;pointer-events:auto;padding-bottom:2px;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;border:1px solid var(--line);background:var(--panel);color:var(--fg);border-radius:999px;padding:7px 12px;font-size:13px;font-weight:600}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.legend{display:flex;gap:10px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);pointer-events:none}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:4px;vertical-align:-1px}
+#count{font-size:12.5px;font-weight:600;color:var(--fg)}
+#card{position:fixed;left:12px;right:12px;bottom:12px;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:14px 16px;box-shadow:0 8px 24px rgba(0,0,0,.18)}
+#card h3{margin:0 0 2px;font-size:17px}
+#card .sub{font-size:13px;color:var(--muted)}
+#card .row{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line)}
+#card .row:first-of-type{border-top:0}
+#card .name{flex:1;min-width:0;font-weight:700}
+.pill{font-size:12px;font-weight:700;border-radius:999px;padding:4px 10px;white-space:nowrap}
+.pill.open{background:var(--open-bg);color:var(--open)}
+.pill.closed{background:var(--closed-bg);color:var(--closed)}
+#close{position:absolute;top:8px;right:10px;border:0;background:none;color:var(--muted);font-size:22px;line-height:1}
+.hint{position:fixed;left:12px;bottom:12px;font-size:11.5px;color:var(--muted);pointer-events:none}
+#loading{position:fixed;inset:0;display:grid;place-items:center;font-size:14px;color:var(--muted);pointer-events:none}
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div class="top">
+  <div class="chips" id="chips"></div>
+  <div class="legend">
+    <span id="count">Loading…</span>
+    <span><i style="background:#22a35a"></i>Inside · door open</span>
+    <span><i style="background:#d0402f"></i>Went out · door closed</span>
+    <span><i style="background:#c9cfd9"></i>No faculty</span>
+  </div>
+</div>
+<div class="hint" id="hint">Drag to turn · pinch to zoom · tap a cabin</div>
+<div id="card" hidden><button id="close" aria-label="Close">×</button><div id="cardBody"></div></div>
+<div id="loading">Loading the 3D block…</div>
+
+<script src="three.min.js"></script>
+<script>
+/* ===== 8th Block · Abdul Kalam Block (matches the drawing) =====
+   Each floor: Lift + stairs | Lab 1 | C1 C2 C3 C4 C5 | CENTRE STAIRS | C6 C7 C8 C9 C10 | HOD / Lab 2 | stairs
+   Below the centre stairs: Gents cabins G1–G4 and Ladies cabins L1–L4 back to back, bathrooms at the end.
+   Floors 3–6 have the faculty cabins. */
+const FLOORS = 6, CABIN_FLOORS = [3,4,5,6], HOD_FLOOR = 6;
+const isCabinFloor = f => CABIN_FLOORS.includes(f);
+
+const $ = s => document.querySelector(s);
+let faculty = [];          // from the app (Firebase)
+let focusFloor = null;     // null = all floors
+
+/* ---------- scene ---------- */
+const stage = $('#stage');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.outputEncoding = THREE.sRGBEncoding;
+stage.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 400);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a93a3, 0.95));
+const sun = new THREE.DirectionalLight(0xffffff, 0.5); sun.position.set(10, 30, 20); scene.add(sun);
+
+const COL = { classroom:0xb9c7b0, lab:0xc3bad6, hod:0xe0a96d, stair:0x5e6676, lift:0x3f78b5, wc:0xd5d9e0, slab:0xe4e7ee,
+              cabinIdle:0xc9cfd9, open:0x22a35a, closed:0xd0402f };
+const SLOTS = [{t:'stair',w:1.6},{t:'lift',w:1.4},{i:'lab1',w:2.6},
+  {c:1,w:2.4},{c:2,w:2.4},{c:3,w:2.4},{c:4,w:2.4},{c:5,w:2.4},{t:'stair',w:2.4,centre:true},
+  {c:6,w:2.4},{c:7,w:2.4},{c:8,w:2.4},{c:9,w:2.4},{c:10,w:2.4},{i:'hod',w:2.6},{t:'stair',w:1.6}];
+const TOTAL = SLOTS.reduce((s,x)=>s+x.w,0);
+{ let x = -TOTAL/2; SLOTS.forEach(s => { s.x = x + s.w/2; x += s.w; }); }
+const ROW_Z = -2.0, ROW_D = 2.6, COR = 0.7;
+const CAB_X = 1.0, CAB_W = 1.8, CAB_D = 1.7, BZ0 = COR, BZ1 = BZ0 + CAB_D*4, WC_D = 1.8, OUT = CAB_X + CAB_W/2 + 1.0;
+const FY = f => (f-1) * 1.8;
+const cabinPos = (side, n) => ({ x: (side === 'G' ? -1 : 1) * CAB_X, z: BZ0 + CAB_D/2 + (n-1)*CAB_D });
+
+let roofSign = null;
+const floorMats = {};          // floor -> materials (to fade other floors)
+const cabinMeshes = {};        // "4G2" -> { mesh, floor, side, n }
+const pickables = [];
+
+function M(color, f){ const m = new THREE.MeshLambertMaterial({ color, transparent: true, opacity: 1 }); (floorMats[f] ||= []).push(m); return m; }
+function box(w,h,d,m,x,y,z){ const o = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), m); o.position.set(x,y,z); scene.add(o); return o; }
+function tex(text, sub, w=256, h=128, bg='#ffffff', fg='#18202e'){
+  const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d');
+  g.fillStyle = bg; g.fillRect(0,0,w,h); g.fillStyle = fg; g.textAlign = 'center';
+  let size = 48; do { g.font = `700 ${size}px system-ui, sans-serif`; size -= 2; } while (g.measureText(text).width > w-20 && size > 14);
+  g.fillText(text, w/2, sub ? h*0.52 : h*0.64);
+  if (sub) { g.globalAlpha = 0.7; g.font = `600 24px ui-monospace, monospace`; g.fillText(sub, w/2, h*0.84); g.globalAlpha = 1; }
+  const t = new THREE.CanvasTexture(c); t.encoding = THREE.sRGBEncoding; t.anisotropy = 4; return t;
+}
+function flat(t, w, h, x, y, z, f){
+  const m = new THREE.MeshBasicMaterial({ map: t, transparent: true, opacity: 1 }); (floorMats[f] ||= []).push(m);
+  const p = new THREE.Mesh(new THREE.PlaneGeometry(w, h), m); p.rotation.x = -Math.PI/2; p.position.set(x, y, z); scene.add(p); return p;
+}
+
+function build(){
+  for (let f = 1; f <= FLOORS; f++) {
+    const y = FY(f), cab = isCabinFloor(f);
+    box(TOTAL+0.5, 0.12, ROW_D + COR*2 + 0.4, M(COL.slab, f), 0, y-0.06, (ROW_Z - ROW_D/2 + COR)/2);
+    box(OUT*2 + 0.4, 0.12, BZ1 - BZ0 + WC_D + 0.2, M(COL.slab, f), 0, y-0.06, (BZ0 + BZ1 + WC_D)/2);
+    // main row
+    SLOTS.forEach(s => {
+      if (s.t === 'stair') {
+        const m = M(COL.stair, f);
+        for (let k = 0; k < 5; k++) box(s.w-0.2, 0.16*(k+1), 0.46, m, s.x, y+0.08*(k+1), ROW_Z - ROW_D/2 + 0.25 + k*0.46);
+        if (f === 1 && s.centre) flat(tex('Entrance', null, 256, 96, '#17834a', '#ffffff'), s.w-0.2, (s.w-0.2)*0.375, s.x, y+0.02, 0, f);
+        return;
+      }
+      let color, title, sub, bg, fg;
+      if (s.t === 'lift') { color = COL.lift; title = 'Lift'; bg = '#3f78b5'; fg = '#ffffff'; }
+      else if (s.i === 'lab1') { color = COL.lab; title = 'Lab 1'; sub = `8-${f}LAB1`; }
+      else if (s.i === 'hod') { const hod = f === HOD_FLOOR; color = hod ? COL.hod : COL.lab; title = hod ? 'HOD' : 'Lab 2'; sub = hod ? `8-${f}HOD` : `8-${f}LAB2`; }
+      else { color = COL.classroom; title = 'C' + s.c; sub = `8-${f}${String(s.c).padStart(2,'0')}`; }
+      box(s.w-0.1, 0.75, ROW_D, M(color, f), s.x, y+0.375, ROW_Z);
+      flat(tex(title, sub, 256, 128, bg, fg), s.w-0.3, (s.w-0.3)/2, s.x, y+0.77, ROW_Z, f);
+    });
+    // cabins below the centre stairs
+    if (cab) {
+      box(0.08, 0.95, BZ1-BZ0, M(0x7d8698, f), 0, y+0.475, (BZ0+BZ1)/2);
+      for (const side of ['G','L']) for (let n = 1; n <= 4; n++) {
+        const p = cabinPos(side, n);
+        const mesh = box(CAB_W-0.1, 0.75, CAB_D-0.12, M(COL.cabinIdle, f), p.x, y+0.375, p.z);
+        flat(tex(side + n, `8-${f}${side}${n}`), 1.4, 0.7, p.x, y+0.77, p.z, f);
+        const key = `${f}${side}${n}`;
+        mesh.userData = { key };
+        cabinMeshes[key] = { mesh, floor: f, side, n };
+        pickables.push(mesh);
+      }
+      for (const side of [-1, 1]) {
+        box(OUT-0.2, 0.75, WC_D-0.1, M(COL.wc, f), side*OUT/2, y+0.375, BZ1 + WC_D/2);
+        flat(tex(side < 0 ? 'Gents WC' : 'Ladies WC', null, 320, 128), 2.2, 0.88, side*OUT/2, y+0.77, BZ1 + WC_D/2, f);
+      }
+    } else {
+      for (const side of [-1, 1]) {
+        const c = side < 0 ? 11 : 12;
+        box(CAB_W-0.1, 0.75, BZ1-BZ0-0.1, M(COL.classroom, f), side*CAB_X, y+0.375, (BZ0+BZ1)/2);
+        flat(tex('C' + c, `8-${f}${c}`), 1.4, 0.7, side*CAB_X, y+0.77, (BZ0+BZ1)/2, f);
+        box(OUT-0.2, 0.75, WC_D-0.1, M(COL.wc, f), side*OUT/2, y+0.375, BZ1 + WC_D/2);
+      }
+    }
+    const fm = new THREE.SpriteMaterial({ map: tex('Floor ' + f, cab ? 'cabins' : 'classes', 256, 128, '#2b4fb8', '#ffffff'), transparent: true, opacity: 1 });
+    (floorMats[f] ||= []).push(fm);
+    const fs = new THREE.Sprite(fm); fs.scale.set(2.4, 1.2, 1); fs.position.set(-TOTAL/2 - 1.9, y + 0.5, ROW_Z); scene.add(fs);
+  }
+  const rs = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex('Abdul Kalam Block', '8th Block · CSE', 512, 128, '#18202e', '#ffffff') }));
+  rs.scale.set(8, 2, 1); rs.position.set(0, FY(FLOORS) + 2.6, ROW_Z); scene.add(rs); roofSign = rs;
+}
+
+/* ---------- faculty pins ---------- */
+const pins = new THREE.Group(); scene.add(pins);
+function initials(n){ return String(n||'?').replace(/^(Dr|Mr|Mrs|Ms|Prof)\.?\s*/i,'').split(/[\s.]+/).filter(Boolean).slice(-2).map(w=>w[0]).join('').toUpperCase() || '?'; }
+function facKey(p){ const f = Number(p.cabinFloor), n = Number(p.cabinNo); const side = p.gender === 'F' ? 'L' : 'G'; return `${f}${side}${n}`; }
+function clearGroup(g){ g.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); } }); g.clear(); }
+
+function paint(){
+  // reset cabins
+  Object.values(cabinMeshes).forEach(c => c.mesh.material.color.setHex(COL.cabinIdle));
+  clearGroup(pins);
+  for (let i = pickables.length - 1; i >= 0; i--) if (pickables[i].userData.pin) pickables.splice(i, 1);
+  let inside = 0;
+  const byKey = {};
+  faculty.forEach(p => { (byKey[facKey(p)] ||= []).push(p); });
+  Object.entries(byKey).forEach(([key, list]) => {
+    const c = cabinMeshes[key]; if (!c) return;
+    const open = list.some(p => p.cabinOpen === true);
+    c.mesh.material.color.setHex(open ? COL.open : COL.closed);
+    const p0 = list.find(p => p.cabinOpen === true) || list[0];
+    const pos = cabinPos(c.side, c.n);
+    const label = list.length > 1 ? `${initials(p0.name)}+${list.length-1}` : initials(p0.name);
+    const sm = new THREE.SpriteMaterial({ map: tex(label, null, 192, 112, open ? '#17834a' : '#c03a2b', '#ffffff'), depthTest: false, transparent: true, opacity: 1 });
+    (floorMats[c.floor] ||= []).push(sm);
+    const s = new THREE.Sprite(sm); s.scale.set(1.1, 0.64, 1); s.position.set(pos.x, FY(c.floor) + 1.35, pos.z); s.renderOrder = 10;
+    s.userData = { key, pin: true, floor: c.floor, base: FY(c.floor) + 1.35 };
+    pins.add(s); pickables.push(s);
+  });
+  faculty.forEach(p => { if (p.cabinOpen === true) inside++; });
+  $('#count').textContent = `${inside} of ${faculty.length} faculty in their cabin`;
+  applyFocus();
+  if (openKey) showCard(openKey);
+}
+
+/* ---------- floors ---------- */
+function buildChips(){
+  const floors = [null, ...CABIN_FLOORS, ...[1,2]];
+  $('#chips').innerHTML = floors.map(f => `<button class="chip${f === focusFloor ? ' on' : ''}" data-f="${f ?? ''}">${f === null ? 'All floors' : 'Floor ' + f}</button>`).join('');
+}
+$('#chips').addEventListener('click', e => {
+  const b = e.target.closest('[data-f]'); if (!b) return;
+  setFocus(b.dataset.f === '' ? null : Number(b.dataset.f));
+});
+function applyFocus(){
+  for (const f in floorMats) floorMats[f].forEach(m => { const on = focusFloor === null || Number(f) === focusFloor; m.opacity = on ? 1 : 0.06; m.depthWrite = on; });
+  if (roofSign) roofSign.visible = focusFloor === null;
+  pins.children.forEach(s => { s.visible = focusFloor === null || s.userData.floor === focusFloor; });
+}
+function setFocus(f, x = 0, z = 1.5){
+  focusFloor = f; buildChips(); applyFocus();
+  if (f === null) Object.assign(goal, { theta: 0.35, phi: 0.98, r: baseR(), tx: 0, ty: FY(3.5), tz: 1.5 });
+  else Object.assign(goal, { theta: 0.3, phi: 0.9, r: baseR() * 0.42, tx: x * 0.8, ty: FY(f) + 0.4, tz: z * 0.6 });
+}
+
+/* ---------- card ---------- */
+let openKey = null;
+function ago(ms){ if (!ms) return ''; const m = Math.round((Date.now() - ms) / 60000); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : m < 1440 ? Math.floor(m/60) + ' hr ago' : Math.floor(m/1440) + ' days ago'; }
+function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function showCard(key){
+  openKey = key;
+  const c = cabinMeshes[key]; if (!c) return;
+  const list = faculty.filter(p => facKey(p) === key);
+  const rows = list.length ? list.map(p => `<div class="row"><span class="name">${esc(p.name)}</span>
+      <span class="pill ${p.cabinOpen ? 'open' : 'closed'}">${p.cabinOpen ? 'Inside · Door OPEN' : 'Went out · Door CLOSED'}</span></div>
+      <div class="sub" style="margin:-4px 0 4px">${p.cabinOpen ? 'Came in ' : 'Left '}${ago(p.updatedAt)}</div>`).join('')
+    : `<div class="sub" style="padding:8px 0">No faculty assigned to this cabin.</div>`;
+  $('#cardBody').innerHTML = `<h3>Floor ${c.floor} · Cabin ${c.side}${c.n}</h3><div class="sub">${c.side === 'G' ? 'Gents' : 'Ladies'} faculty cabins, below the centre stairs</div>${rows}`;
+  $('#card').hidden = false; $('#hint').hidden = true;
+}
+$('#close').addEventListener('click', () => { $('#card').hidden = true; $('#hint').hidden = false; openKey = null; });
+
+/* ---------- called by the app ---------- */
+window.setFaculty = list => { faculty = Array.isArray(list) ? list : []; $('#loading').hidden = true; paint(); };
+window.focusFaculty = id => {
+  const p = faculty.find(x => x.id === id); if (!p) return;
+  const key = facKey(p), c = cabinMeshes[key]; if (!c) return;
+  const pos = cabinPos(c.side, c.n);
+  setFocus(c.floor, pos.x, pos.z);
+  showCard(key);
+};
+
+/* ---------- camera: drag to turn, pinch to zoom ---------- */
+const orbit = { theta: 0.35, phi: 0.98, r: 50, tx: 0, ty: FY(3.5), tz: 1.5 };
+const goal = { ...orbit };
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function baseR(){ const a = camera.aspect || 0.6; return clamp(16 + 21 / a, 30, 90); }
+const cv = renderer.domElement, ptrs = new Map(); let down = null, pinch = null;
+cv.addEventListener('pointerdown', e => { ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY }); try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+  down = { x: e.clientX, y: e.clientY };
+  if (ptrs.size === 2) { const [a, b] = [...ptrs.values()]; pinch = { d: Math.hypot(a.x-b.x, a.y-b.y), r: goal.r }; } });
+cv.addEventListener('pointermove', e => { const pr = ptrs.get(e.pointerId); if (!pr) return;
+  if (ptrs.size === 2 && pinch) { pr.x = e.clientX; pr.y = e.clientY; const [a, b] = [...ptrs.values()]; goal.r = clamp(pinch.r * pinch.d / Math.max(20, Math.hypot(a.x-b.x, a.y-b.y)), 6, 120); return; }
+  goal.theta -= (e.clientX - pr.x) * 0.006; goal.phi = clamp(goal.phi - (e.clientY - pr.y) * 0.005, 0.35, 1.5); pr.x = e.clientX; pr.y = e.clientY; });
+const up = e => { const n = ptrs.size; ptrs.delete(e.pointerId); if (ptrs.size < 2) pinch = null;
+  if (e.type === 'pointerup' && n === 1 && down && Math.hypot(e.clientX-down.x, e.clientY-down.y) < 8) pick(e); };
+cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
+cv.addEventListener('wheel', e => { e.preventDefault(); goal.r = clamp(goal.r * (1 + e.deltaY * 0.001), 6, 120); }, { passive: false });
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+function pick(e){
+  const r = cv.getBoundingClientRect(); ndc.set(((e.clientX-r.left)/r.width)*2-1, -((e.clientY-r.top)/r.height)*2+1);
+  ray.setFromCamera(ndc, camera);
+  const vis = pickables.filter(o => { const f = o.userData.pin ? o.userData.floor : cabinMeshes[o.userData.key]?.floor; return focusFloor === null || f === focusFloor; });
+  const hit = ray.intersectObjects(vis, false)[0];
+  if (hit) { const key = hit.object.userData.key; const c = cabinMeshes[key]; if (focusFloor === null) { const p = cabinPos(c.side, c.n); setFocus(c.floor, p.x, p.z); } showCard(key); }
+}
+
+function resize(){ const w = innerWidth, h = innerHeight; renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); if (focusFloor === null) goal.r = baseR(); }
+addEventListener('resize', resize);
+const t0 = performance.now();
+function tick(now){
+  for (const k of ['theta','phi','r','tx','ty','tz']) orbit[k] += (goal[k] - orbit[k]) * 0.12;
+  camera.position.set(orbit.tx + orbit.r*Math.sin(orbit.phi)*Math.sin(orbit.theta), orbit.ty + orbit.r*Math.cos(orbit.phi), orbit.tz + orbit.r*Math.sin(orbit.phi)*Math.cos(orbit.theta));
+  camera.lookAt(orbit.tx, orbit.ty, orbit.tz);
+  const s = (now - t0) / 1000;
+  pins.children.forEach(p => { p.position.y = p.userData.base + Math.sin(s*2.4 + p.position.z) * 0.08; });
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+
+build(); buildChips(); resize(); orbit.r = goal.r = baseR();
+requestAnimationFrame(tick);
+// Opened in a normal browser (no app): show the empty block after a moment.
+setTimeout(() => { if (!$('#loading').hidden && !faculty.length) $('#loading').textContent = 'Waiting for faculty data…'; }, 4000);
+</script>
+</body>
+</html>

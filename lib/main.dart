@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -7,6 +8,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 
 import 'firebase_config.dart';
 import 'rooms.dart';
@@ -77,7 +79,7 @@ class KalamApp extends StatelessWidget {
       darkTheme: ThemeData(colorSchemeSeed: const Color(0xFF2B4FB8), useMaterial3: true, brightness: Brightness.dark),
       home: initError != null
           ? MessageScreen(message: initError!)
-          : (appMode == AppMode.student ? const StudentScreen() : const StartScreen()),
+          : (appMode == AppMode.student ? const StudentHome() : const StartScreen()),
     );
   }
 }
@@ -173,7 +175,8 @@ class RoleScreen extends StatelessWidget {
 // ---------------- Student view: who is in their cabin ----------------
 class StudentScreen extends StatefulWidget {
   final bool fromFaculty;
-  const StudentScreen({super.key, this.fromFaculty = false});
+  final void Function(String facultyId)? onShowIn3D;
+  const StudentScreen({super.key, this.fromFaculty = false, this.onShowIn3D});
   @override
   State<StudentScreen> createState() => _StudentScreenState();
 }
@@ -260,7 +263,7 @@ class _StudentScreenState extends State<StudentScreen> {
                 Text('$inCount of ${snap.data!.docs.length} faculty in their cabin now',
                     style: TextStyle(color: scheme.onSurfaceVariant)),
                 const SizedBox(height: 8),
-                for (final d in docs) _card(d.data(), scheme),
+                for (final d in docs) _card(d.id, d.data(), scheme),
               ]);
             },
           ),
@@ -269,7 +272,7 @@ class _StudentScreenState extends State<StudentScreen> {
     );
   }
 
-  Widget _card(Map<String, dynamic> f, ColorScheme scheme) {
+  Widget _card(String id, Map<String, dynamic> f, ColorScheme scheme) {
     final open = f['cabinOpen'] == true;
     final gender = f['gender'] == 'F' ? 'L' : 'G';
     final cabin = 'Floor ${f['cabinFloor']} · Cabin $gender${f['cabinNo']}';
@@ -277,8 +280,11 @@ class _StudentScreenState extends State<StudentScreen> {
     final ms = (f['updatedAt'] as num?)?.toInt();
     final since = _ago(ms).replaceFirst('updated ', '');
     return Card(
+      clipBehavior: Clip.antiAlias,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: BorderSide(color: color, width: 2)),
-      child: Padding(
+      child: InkWell(
+        onTap: widget.onShowIn3D == null ? null : () => widget.onShowIn3D!(id),
+        child: Padding(
         padding: const EdgeInsets.all(16),
         child: Row(children: [
           Icon(open ? Icons.meeting_room : Icons.door_front_door, color: color, size: 44),
@@ -293,8 +299,119 @@ class _StudentScreenState extends State<StudentScreen> {
             if (ms != null)
               Text(open ? 'Came in $since' : 'Left $since', style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
           ])),
+          if (widget.onShowIn3D != null) Icon(Icons.view_in_ar, color: scheme.onSurfaceVariant),
         ]),
       ),
+      ),
+    );
+  }
+}
+
+// ---------------- Kalam Student: List + 3D Block ----------------
+class StudentHome extends StatefulWidget {
+  const StudentHome({super.key});
+  @override
+  State<StudentHome> createState() => _StudentHomeState();
+}
+
+class _StudentHomeState extends State<StudentHome> {
+  int _tab = 0;
+  final _block = GlobalKey<_Block3DScreenState>();
+
+  void _showIn3D(String id) {
+    setState(() => _tab = 1);
+    _block.currentState?.focusFaculty(id);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(index: _tab, children: [
+        StudentScreen(onShowIn3D: _showIn3D),
+        Block3DScreen(key: _block),
+      ]),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tab,
+        onDestinationSelected: (i) => setState(() => _tab = i),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.list_alt), label: 'Faculty list'),
+          NavigationDestination(icon: Icon(Icons.view_in_ar), label: '3D Block'),
+        ],
+      ),
+    );
+  }
+}
+
+// The 3D Abdul Kalam Block (assets/block3d.html), fed with live faculty data from Firebase.
+class Block3DScreen extends StatefulWidget {
+  const Block3DScreen({super.key});
+  @override
+  State<Block3DScreen> createState() => _Block3DScreenState();
+}
+
+class _Block3DScreenState extends State<Block3DScreen> {
+  late final WebViewController _web;
+  StreamSubscription? _sub;
+  bool _pageReady = false;
+  String? _lastJson;
+  String? _pendingFocus;
+
+  @override
+  void initState() {
+    super.initState();
+    _web = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(NavigationDelegate(onPageFinished: (_) {
+        _pageReady = true;
+        _send();
+        final f = _pendingFocus;
+        if (f != null) focusFaculty(f);
+      }))
+      ..loadFlutterAsset('assets/block3d.html');
+    _sub = FirebaseFirestore.instance.collection(facultyCollection).snapshots().listen((snap) {
+      final list = snap.docs.map((d) {
+        final f = d.data();
+        return {
+          'id': d.id,
+          'name': (f['name'] ?? 'Faculty').toString(),
+          'gender': (f['gender'] ?? 'M').toString(),
+          'cabinFloor': (f['cabinFloor'] as num?)?.toInt(),
+          'cabinNo': (f['cabinNo'] as num?)?.toInt(),
+          'cabinOpen': f['cabinOpen'] == true,
+          'updatedAt': (f['updatedAt'] as num?)?.toInt(),
+        };
+      }).toList();
+      _lastJson = jsonEncode(list);
+      _send();
+    });
+  }
+
+  void _send() {
+    final j = _lastJson;
+    if (!_pageReady || j == null) return;
+    _web.runJavaScript('window.setFaculty($j)').catchError((_) {});
+  }
+
+  void focusFaculty(String id) {
+    if (!_pageReady || _lastJson == null) {
+      _pendingFocus = id;
+      return;
+    }
+    _pendingFocus = null;
+    _web.runJavaScript('window.focusFaculty(${jsonEncode(id)})').catchError((_) {});
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Abdul Kalam Block · 3D')),
+      body: WebViewWidget(controller: _web),
     );
   }
 }
