@@ -111,3 +111,26 @@ if mode == "student":
         if "applicationId" in t2 and "kalam_student" not in t2.split("applicationId", 1)[1].split("\n", 1)[0]:
             raise SystemExit(f"{name}: could not change applicationId to kalam_student")
         print(f"{name}: package set to in.kalamfinder.kalam_student")
+
+# 6. App icon (blue for Kalam Faculty, green for Kalam Student), with an adaptive icon for Android 8+
+import shutil
+res = root / "android/app/src/main/res"
+src = root / "assets/icons" / mode
+bg_color = "#2B4FB8" if mode == "faculty" else "#17834A"
+for d in ["mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"]:
+    out = res / f"mipmap-{d}"
+    out.mkdir(parents=True, exist_ok=True)
+    for f in ["ic_launcher.png", "ic_launcher_foreground.png"]:
+        shutil.copyfile(src / f"mipmap-{d}" / f, out / f)
+(res / "mipmap-anydpi-v26").mkdir(parents=True, exist_ok=True)
+(res / "mipmap-anydpi-v26/ic_launcher.xml").write_text(
+    '<?xml version="1.0" encoding="utf-8"?>\n'
+    '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+    '    <background android:drawable="@color/ic_launcher_background"/>\n'
+    '    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+    '</adaptive-icon>\n')
+(res / "values").mkdir(parents=True, exist_ok=True)
+(res / "values/ic_launcher_background.xml").write_text(
+    '<?xml version="1.0" encoding="utf-8"?>\n'
+    f'<resources>\n    <color name="ic_launcher_background">{bg_color}</color>\n</resources>\n')
+print(f"App icon set for {mode}")
