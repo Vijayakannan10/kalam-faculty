@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -599,6 +600,50 @@ class Presence extends ChangeNotifier with WidgetsBindingObserver {
 
   bool get running => facultyId != null;
 
+  // One faculty = one phone. Each install has its own ID; the phone that signed in last owns the record.
+  String? deviceId;
+  final List<int> _myStamps = [];   // updatedAt values this phone wrote
+  DateTime? foreignAt;              // another phone keeps changing this faculty's record
+  DateTime? _lastForeign;
+  bool otherPhoneOwns = false;      // another phone signed in after this one: stop writing
+  String? writeError;               // last Firebase save error, if any
+  DateTime? _backoffUntil;
+
+  Future<String> _loadDeviceId() async {
+    final prefs = await SharedPreferences.getInstance();
+    var id = prefs.getString('deviceId');
+    if (id == null) {
+      final r = Random.secure();
+      id = List.generate(8, (_) => 'abcdefghjkmnpqrstuvwxyz23456789'[r.nextInt(31)]).join();
+      await prefs.setString('deviceId', id);
+    }
+    return id;
+  }
+
+  int _stamp() {
+    var t = DateTime.now().millisecondsSinceEpoch;
+    if (_myStamps.isNotEmpty && t <= _myStamps.last) t = _myStamps.last + 1;
+    _myStamps.add(t);
+    if (_myStamps.length > 50) _myStamps.removeAt(0);
+    return t;
+  }
+
+  /// Make this phone the one that reports for this faculty.
+  Future<void> claim() async {
+    otherPhoneOwns = false;
+    foreignAt = null;
+    notifyListeners();
+    final id = deviceId;
+    if (id == null || facultyId == null) return;
+    try {
+      await _doc.update({'deviceId': id, 'updatedAt': _stamp()});
+      writeError = null;
+    } catch (e) {
+      writeError = e.toString();
+    }
+    notifyListeners();
+  }
+
   DocumentReference<Map<String, dynamic>> get _doc =>
       FirebaseFirestore.instance.collection(facultyCollection).doc(facultyId);
 
@@ -606,10 +651,28 @@ class Presence extends ChangeNotifier with WidgetsBindingObserver {
     if (facultyId == id) return;
     if (facultyId != null) await stop();
     facultyId = id;
+    deviceId ??= await _loadDeviceId();
     WidgetsBinding.instance.addObserver(this);
+    claim(); // signing in here takes over from any other phone (not awaited: works offline too)
     _meSub = _doc.snapshots().listen((snap) {
       final oldFloor = me?['cabinFloor'];
       me = snap.data();
+      final d = me;
+      if (d != null && !snap.metadata.hasPendingWrites) {
+        final stamp = (d['updatedAt'] as num?)?.toInt();
+        final owner = d['deviceId'];
+        if (owner != null && owner != deviceId) {
+          // another phone signed in as this faculty after us: let it report, stop writing here
+          otherPhoneOwns = true;
+          foreignAt = DateTime.now();
+        } else if (stamp != null && !_myStamps.contains(stamp)) {
+          // someone else (an older app on another phone) changed the record.
+          // Warn only if it happens again within a minute, so one late write does not raise an alarm.
+          final t = DateTime.now();
+          if (_lastForeign != null && t.difference(_lastForeign!) < const Duration(seconds: 60)) foreignAt = t;
+          _lastForeign = t;
+        }
+      }
       notifyListeners();
       if (me?['cabinFloor'] != oldFloor && scanStartedAt != null) {
         Future.delayed(const Duration(seconds: 9), () {
@@ -634,7 +697,7 @@ class Presence extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> stop() async {
-    if (facultyId != null) {
+    if (facultyId != null && !otherPhoneOwns) {
       // signing out of this phone: show the door as closed
       try {
         _doc.update({'status': 'away', 'cabinOpen': false, 'updatedAt': DateTime.now().millisecondsSinceEpoch}).catchError((_) {});
@@ -663,6 +726,11 @@ class Presence extends ChangeNotifier with WidgetsBindingObserver {
     _lastAnyResult = null;
     bgRunning = false;
     problem = null;
+    otherPhoneOwns = false;
+    foreignAt = null;
+    _lastForeign = null;
+    writeError = null;
+    _myStamps.clear();
     notifyListeners();
   }
 
@@ -811,7 +879,8 @@ class Presence extends ChangeNotifier with WidgetsBindingObserver {
   // Every 2 seconds: make sure Firebase shows what the phone sees right now. If not, fix it.
   void _sync(DateTime now) {
     final m = me;
-    if (m == null) return;
+    if (m == null || otherPhoneOwns) return;
+    if (_backoffUntil != null && now.isBefore(_backoffUntil!)) return;
     final r = room;
     final wantOpen = r != null && isOwnCabin(r);
     final wantStatus = r == null ? 'away' : (wantOpen ? 'cabin' : 'class');
@@ -861,8 +930,10 @@ class Presence extends ChangeNotifier with WidgetsBindingObserver {
 
   void _push(Room? r, {bool heartbeatOnly = false}) {
     final now = DateTime.now();
-    if (_lastWrite != null && now.difference(_lastWrite!) < const Duration(seconds: 1)) return;
-    final data = <String, dynamic>{'updatedAt': now.millisecondsSinceEpoch, 'source': 'beacon'};
+    if (otherPhoneOwns) return;
+    if (_lastWrite != null && now.difference(_lastWrite!) < const Duration(seconds: 3)) return;
+    // deviceId is written only by claim(), so a late write from an old phone never steals ownership back
+    final data = <String, dynamic>{'updatedAt': _stamp(), 'source': 'beacon'};
     if (!heartbeatOnly) {
       if (r != null) {
         final own = isOwnCabin(r);
@@ -874,9 +945,14 @@ class Presence extends ChangeNotifier with WidgetsBindingObserver {
       }
     }
     _lastWrite = now;
-    // Don't wait for the server: Firebase queues the write and shows it locally at once.
-    // If it fails, _sync sees the difference and writes again.
-    _doc.update(data).catchError((_) {});
+    // Firebase shows the write locally at once and sends it in the background.
+    _doc.update(data).then((_) {
+      if (writeError != null) { writeError = null; notifyListeners(); }
+    }).catchError((Object e) {
+      writeError = e.toString();
+      _backoffUntil = DateTime.now().add(const Duration(seconds: 10));
+      notifyListeners();
+    });
   }
 }
 
@@ -912,8 +988,11 @@ class _HomeScreenState extends State<HomeScreen> {
     final scheme = Theme.of(context).colorScheme;
     final me = p.me;
     final cabinOpen = me?['cabinOpen'] == true;
-    final nearby = p.seen.entries.toList()..sort((a, b) => b.value.rssi.compareTo(a.value.rssi));
     final now = DateTime.now();
+    // only beacons heard in the last 15 seconds (older readings are out of date)
+    final nearby = p.seen.entries.where((e) => now.difference(e.value.last) <= lostAfter).toList()
+      ..sort((a, b) => b.value.rssi.compareTo(a.value.rssi));
+    final foreignRecent = p.foreignAt != null && now.difference(p.foreignAt!) < const Duration(minutes: 2);
     final deviceCount = p.allDevices.values.where((t) => now.difference(t) < const Duration(seconds: 30)).length;
     final scanAge = p.scanStartedAt == null ? Duration.zero : now.difference(p.scanStartedAt!);
     final noResults = deviceCount == 0 && scanAge > const Duration(seconds: 10);
@@ -932,6 +1011,42 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
       body: ListView(padding: const EdgeInsets.all(16), children: [
+        if (p.otherPhoneOwns)
+          Card(
+            color: scheme.errorContainer,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('${me?['name'] ?? 'This faculty'} is signed in on another phone',
+                    style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: scheme.onErrorContainer)),
+                const SizedBox(height: 4),
+                Text('Only one phone can report a cabin door. This phone has stopped reporting so the two phones do not fight.',
+                    style: TextStyle(color: scheme.onErrorContainer)),
+                const SizedBox(height: 10),
+                FilledButton(onPressed: p.claim, child: const Text('Use this phone instead')),
+              ]),
+            ),
+          )
+        else if (foreignRecent)
+          Card(
+            color: scheme.errorContainer,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text('Another phone is also reporting as ${me?['name'] ?? 'this faculty'} and is changing the door. '
+                  'On that phone, open Kalam Faculty and tap the person icon (Change faculty), or uninstall the app there. '
+                  'Use only one phone per faculty.',
+                  style: TextStyle(color: scheme.onErrorContainer, fontWeight: FontWeight.w600)),
+            ),
+          ),
+        if (p.writeError != null)
+          Card(
+            color: scheme.errorContainer,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text('Could not save to Firebase, so students may see old information.\n${p.writeError}',
+                  style: TextStyle(color: scheme.onErrorContainer)),
+            ),
+          ),
         if (p.problem != null)
           Card(color: scheme.errorContainer, child: Padding(padding: const EdgeInsets.all(16), child: Text(p.problem!, style: TextStyle(color: scheme.onErrorContainer)))),
         Card(
@@ -1013,6 +1128,7 @@ class _HomeScreenState extends State<HomeScreen> {
               Text('Location permission: ${permText(Permission.location)}'),
               Text('Location (GPS) switch: ${p.locationServiceOn ? 'On' : 'Off'}'),
               Text('Background mode: ${p.bgRunning ? 'On (works with the phone locked)' : 'Off'}'),
+              Text('This phone ID: ${p.deviceId ?? '…'} · ${p.otherPhoneOwns ? 'not reporting' : 'reporting'}'),
               if (noResults) ...[
                 const SizedBox(height: 10),
                 const Text('No Kalam beacon heard right now. This is normal when you are away from your cabin. '
