@@ -608,6 +608,7 @@ class Presence extends ChangeNotifier with WidgetsBindingObserver {
   bool otherPhoneOwns = false;      // another phone signed in after this one: stop writing
   String? writeError;               // last Firebase save error, if any
   DateTime? _backoffUntil;
+  int _failCount = 0;
 
   Future<String> _loadDeviceId() async {
     final prefs = await SharedPreferences.getInstance();
@@ -946,11 +947,16 @@ class Presence extends ChangeNotifier with WidgetsBindingObserver {
     }
     _lastWrite = now;
     // Firebase shows the write locally at once and sends it in the background.
+    // If Firebase refuses, it puts the old value back on screen. Without a pause the app would retry
+    // every few seconds and the door would flip OPEN/CLOSED. So wait longer after each failure (10 s … 2 min).
     _doc.update(data).then((_) {
+      _failCount = 0;
       if (writeError != null) { writeError = null; notifyListeners(); }
     }).catchError((Object e) {
+      _failCount++;
       writeError = e.toString();
-      _backoffUntil = DateTime.now().add(const Duration(seconds: 10));
+      final wait = Duration(seconds: min(120, 10 * (1 << min(_failCount - 1, 4))));
+      _backoffUntil = DateTime.now().add(wait);
       notifyListeners();
     });
   }
