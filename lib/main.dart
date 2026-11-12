@@ -5,6 +5,7 @@ import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -13,6 +14,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import 'firebase_config.dart';
 import 'rooms.dart';
+import 'ui_kit.dart';
 
 // ---------------- Beacon rules (from the home test with ESP32) ----------------
 // Near the beacon: about -45 dBm. Other side / another room: -60 to -80 dBm.
@@ -76,8 +78,8 @@ class KalamApp extends StatelessWidget {
     return MaterialApp(
       title: appMode == AppMode.student ? 'Kalam Student' : 'Kalam Faculty',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: const Color(0xFF2B4FB8), useMaterial3: true),
-      darkTheme: ThemeData(colorSchemeSeed: const Color(0xFF2B4FB8), useMaterial3: true, brightness: Brightness.dark),
+      theme: kalamTheme(appMode == AppMode.student ? kStudentGreen : kFacultyBlue, Brightness.light),
+      darkTheme: kalamTheme(appMode == AppMode.student ? kStudentGreen : kFacultyBlue, Brightness.dark),
       home: initError != null
           ? MessageScreen(message: initError!)
           : (appMode == AppMode.student ? const StudentHome() : const StartScreen()),
@@ -182,127 +184,376 @@ class StudentScreen extends StatefulWidget {
   State<StudentScreen> createState() => _StudentScreenState();
 }
 
+enum _Filter { all, inside, out, favourites }
+
 class _StudentScreenState extends State<StudentScreen> {
   final _search = TextEditingController();
   Timer? _clock;
+  StreamSubscription? _sub;
+  List<QueryDocumentSnapshot<Map<String, dynamic>>> _docs = [];
+  bool _loaded = false;
+  String? _error;
+  _Filter _filter = _Filter.all;
+  Set<String> _favs = {};
+  Set<String> _alerts = {};               // "alert me when back"
+  final Map<String, bool> _lastOpen = {};  // to notice a door opening
 
   @override
   void initState() {
     super.initState();
-    _clock = Timer.periodic(const Duration(seconds: 30), (_) => setState(() {})); // refresh "updated … ago"
+    _clock = Timer.periodic(const Duration(seconds: 30), (_) => setState(() {})); // refresh "… min ago"
+    _loadPrefs();
+    _sub = FirebaseFirestore.instance.collection(facultyCollection).orderBy('name').snapshots().listen((snap) {
+      final opened = <String>[];
+      for (final d in snap.docs) {
+        final open = d.data()['cabinOpen'] == true;
+        final was = _lastOpen[d.id];
+        if (was == false && open && _alerts.contains(d.id)) opened.add(d.id);
+        _lastOpen[d.id] = open;
+      }
+      setState(() {
+        _docs = snap.docs;
+        _loaded = true;
+        _error = null;
+      });
+      for (final id in opened) {
+        _alerts.remove(id);
+        _savePrefs();
+        final name = snap.docs.firstWhere((d) => d.id == id).data()['name'] ?? 'Faculty';
+        _announce('$name is back in the cabin!');
+      }
+    }, onError: (e) => setState(() => _error = e.toString()));
+  }
+
+  Future<void> _loadPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _favs = (prefs.getStringList('favourites') ?? []).toSet();
+      _alerts = (prefs.getStringList('alerts') ?? []).toSet();
+    });
+  }
+
+  Future<void> _savePrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('favourites', _favs.toList());
+    await prefs.setStringList('alerts', _alerts.toList());
+  }
+
+  void _announce(String text) {
+    HapticFeedback.heavyImpact();
+    SystemSound.play(SystemSoundType.alert);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Row(children: [const Icon(Icons.notifications_active, color: Colors.white), const SizedBox(width: 10), Expanded(child: Text(text))]),
+      backgroundColor: kOpen,
+      behavior: SnackBarBehavior.floating,
+      duration: const Duration(seconds: 6),
+    ));
+  }
+
+  void _toggleFav(String id) {
+    setState(() => _favs.contains(id) ? _favs.remove(id) : _favs.add(id));
+    _savePrefs();
+  }
+
+  void _toggleAlert(String id, String name) {
+    final on = !_alerts.contains(id);
+    setState(() => on ? _alerts.add(id) : _alerts.remove(id));
+    _savePrefs();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      behavior: SnackBarBehavior.floating,
+      content: Text(on ? 'We\'ll alert you when $name is back (keep the app open).' : 'Alert for $name turned off.'),
+    ));
   }
 
   @override
   void dispose() {
     _clock?.cancel();
+    _sub?.cancel();
     _search.dispose();
     super.dispose();
-  }
-
-  String _ago(int? ms) {
-    if (ms == null) return 'never updated';
-    final m = DateTime.now().difference(DateTime.fromMillisecondsSinceEpoch(ms)).inMinutes;
-    if (m < 1) return 'updated just now';
-    if (m < 60) return 'updated $m min ago';
-    if (m < 1440) return 'updated ${m ~/ 60} hr ago';
-    return 'updated ${m ~/ 1440} days ago';
-  }
-
-  Future<void> _switchRole() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('role');
-    if (!mounted) return;
-    Navigator.of(context).pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const RoleScreen()), (_) => false);
   }
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final total = _docs.length;
+    final inside = _docs.where((d) => d.data()['cabinOpen'] == true).length;
+    final q = _search.text.trim().toLowerCase();
+    bool match(QueryDocumentSnapshot<Map<String, dynamic>> d) {
+      final f = d.data();
+      if (q.isNotEmpty && !(f['name'] ?? '').toString().toLowerCase().contains(q)) return false;
+      return switch (_filter) {
+        _Filter.inside => f['cabinOpen'] == true,
+        _Filter.out => f['cabinOpen'] != true,
+        _Filter.favourites => _favs.contains(d.id),
+        _Filter.all => true,
+      };
+    }
+
+    final shown = _docs.where(match).toList();
+    final favShown = _filter == _Filter.all ? shown.where((d) => _favs.contains(d.id)).toList() : <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+    final rest = _filter == _Filter.all ? shown.where((d) => !_favs.contains(d.id)).toList() : shown;
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Find faculty'),
-        actions: [
-          if (!widget.fromFaculty && appMode != AppMode.student)
-            IconButton(onPressed: _switchRole, icon: const Icon(Icons.swap_horiz), tooltip: 'Switch to faculty'),
-        ],
-      ),
       body: Column(children: [
-        ListenableBuilder(
-          listenable: Presence.instance,
-          builder: (context, _) {
-            final pr = Presence.instance;
-            if (!pr.running) return const SizedBox.shrink();
-            final name = (pr.me?['name'] ?? 'faculty').toString();
-            return Container(
-              width: double.infinity,
-              color: scheme.secondaryContainer,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-              child: Text('This phone is also reporting $name\'s cabin door, even while you are on this screen.',
-                  style: TextStyle(color: scheme.onSecondaryContainer)),
-            );
-          },
+        GradientHeader(
+          colors: const [kStudentGreen, kStudentGreen2],
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              SizedBox(
+                width: 62,
+                height: 62,
+                child: Stack(alignment: Alignment.center, children: [
+                  SizedBox(
+                    width: 62,
+                    height: 62,
+                    child: CircularProgressIndicator(
+                      value: total == 0 ? 0 : inside / total,
+                      strokeWidth: 6,
+                      backgroundColor: Colors.white24,
+                      valueColor: const AlwaysStoppedAnimation(Colors.white),
+                    ),
+                  ),
+                  Text('$inside/$total', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: Colors.white)),
+                ]),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(_loaded ? '$inside faculty in cabin' : 'Loading…',
+                      style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w800, color: Colors.white)),
+                  const SizedBox(height: 2),
+                  const Row(children: [
+                    Icon(Icons.circle, size: 8, color: Color(0xFFB9F5CF)),
+                    SizedBox(width: 6),
+                    Text('8th Block · Abdul Kalam Block · live', style: TextStyle(fontSize: 12.5, color: Colors.white70)),
+                  ]),
+                ]),
+              ),
+            ]),
+            const SizedBox(height: 14),
+            TextField(
+              controller: _search,
+              onChanged: (_) => setState(() {}),
+              style: const TextStyle(color: Colors.black87),
+              decoration: InputDecoration(
+                hintText: 'Search faculty',
+                prefixIcon: const Icon(Icons.search),
+                filled: true,
+                fillColor: Colors.white,
+                isDense: true,
+                contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
+              ),
+            ),
+          ]),
         ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-          child: TextField(
-            controller: _search,
-            onChanged: (_) => setState(() {}),
-            decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: 'Search faculty name', border: OutlineInputBorder()),
+        SizedBox(
+          height: 52,
+          child: ListView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
+            children: [
+              for (final (f, label) in [
+                (_Filter.all, 'All'),
+                (_Filter.inside, 'Inside'),
+                (_Filter.out, 'Out'),
+                (_Filter.favourites, '★ Favourites'),
+              ])
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: ChoiceChip(label: Text(label), selected: _filter == f, onSelected: (_) => setState(() => _filter = f)),
+                ),
+            ],
           ),
         ),
         Expanded(
-          child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-            stream: FirebaseFirestore.instance.collection(facultyCollection).orderBy('name').snapshots(),
-            builder: (context, snap) {
-              if (snap.hasError) return Center(child: Text('Could not load faculty.\n${snap.error}', textAlign: TextAlign.center));
-              if (!snap.hasData) return const Center(child: CircularProgressIndicator());
-              final q = _search.text.trim().toLowerCase();
-              final docs = snap.data!.docs.where((d) => (d.data()['name'] ?? '').toString().toLowerCase().contains(q)).toList();
-              if (docs.isEmpty) return const Center(child: Text('No faculty found.'));
-              final inCount = snap.data!.docs.where((d) => d.data()['cabinOpen'] == true).length;
-              return ListView(padding: const EdgeInsets.fromLTRB(16, 8, 16, 24), children: [
-                Text('$inCount of ${snap.data!.docs.length} faculty in their cabin now',
-                    style: TextStyle(color: scheme.onSurfaceVariant)),
-                const SizedBox(height: 8),
-                for (final d in docs) _card(d.id, d.data(), scheme),
-              ]);
-            },
-          ),
+          child: _error != null
+              ? Center(child: Padding(padding: const EdgeInsets.all(24), child: Text('Could not load faculty.\n$_error', textAlign: TextAlign.center)))
+              : !_loaded
+                  ? const Center(child: CircularProgressIndicator())
+                  : shown.isEmpty
+                      ? Center(
+                          child: Padding(
+                            padding: const EdgeInsets.all(24),
+                            child: Text(
+                              _filter == _Filter.favourites ? 'No favourites yet. Tap ☆ on a faculty to add them.' : 'No faculty found.',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: scheme.onSurfaceVariant),
+                            ),
+                          ),
+                        )
+                      : ListView(padding: const EdgeInsets.fromLTRB(16, 8, 16, 24), children: [
+                          if (favShown.isNotEmpty) ...[
+                            const SectionLabel('★ Favourites'),
+                            const SizedBox(height: 8),
+                            for (final d in favShown) _card(d.id, d.data(), scheme),
+                            const SizedBox(height: 8),
+                            if (rest.isNotEmpty) const SectionLabel('All faculty'),
+                            if (rest.isNotEmpty) const SizedBox(height: 8),
+                          ],
+                          for (final d in rest) _card(d.id, d.data(), scheme),
+                        ]),
         ),
       ]),
     );
   }
 
   Widget _card(String id, Map<String, dynamic> f, ColorScheme scheme) {
-    final open = f['cabinOpen'] == true;
-    final gender = f['gender'] == 'F' ? 'L' : 'G';
-    final cabin = 'Floor ${f['cabinFloor']} · Cabin $gender${f['cabinNo']}';
-    final color = open ? Colors.green.shade600 : Colors.red.shade600;
-    final ms = (f['updatedAt'] as num?)?.toInt();
-    final since = _ago(ms).replaceFirst('updated ', '');
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: BorderSide(color: color, width: 2)),
-      child: InkWell(
-        onTap: widget.onShowIn3D == null ? null : () => widget.onShowIn3D!(id),
-        child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Row(children: [
-          Icon(open ? Icons.meeting_room : Icons.door_front_door, color: color, size: 44),
-          const SizedBox(width: 14),
-          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text((f['name'] ?? 'Faculty').toString(), style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-            const SizedBox(height: 4),
-            Text(open ? 'Inside the cabin · Door OPEN' : 'Went out · Door CLOSED',
-                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: color)),
-            const SizedBox(height: 2),
-            Text(open ? 'Go to $cabin' : 'Cabin: $cabin', style: TextStyle(color: scheme.onSurfaceVariant)),
-            if (ms != null)
-              Text(open ? 'Came in $since' : 'Left $since', style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
-          ])),
-          if (widget.onShowIn3D != null) Icon(Icons.view_in_ar, color: scheme.onSurfaceVariant),
-        ]),
+    final s = doorOf(f);
+    final color = doorColor(s);
+    final name = (f['name'] ?? 'Faculty').toString();
+    final cabin = 'Floor ${f['cabinFloor']} · ${f['gender'] == 'F' ? 'L' : 'G'}${f['cabinNo']}';
+    final since = (f['since'] as num?)?.toInt() ?? (f['updatedAt'] as num?)?.toInt();
+    final note = (f['note'] ?? '').toString();
+    final fav = _favs.contains(id);
+    final alert = _alerts.contains(id);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Card(
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () => _openDetails(id),
+          child: IntrinsicHeight(
+            child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              Container(width: 6, color: color),
+              const SizedBox(width: 12),
+              Padding(padding: const EdgeInsets.symmetric(vertical: 12), child: Avatar(id: id, name: name)),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Text(name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 2),
+                    Text(doorText(s), style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700, color: color)),
+                    const SizedBox(height: 2),
+                    Text('$cabin${since != null ? ' · ${s == DoorState.out ? 'left' : 'since'} ${hm(since)}' : ''}',
+                        style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
+                    if (note.isNotEmpty) ...[
+                      const SizedBox(height: 5),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(color: scheme.surfaceContainerHighest, borderRadius: BorderRadius.circular(8)),
+                        child: Text(note, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                      ),
+                    ],
+                  ]),
+                ),
+              ),
+              Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                IconButton(
+                  onPressed: () => _toggleFav(id),
+                  icon: Icon(fav ? Icons.star_rounded : Icons.star_outline_rounded, color: fav ? const Color(0xFFE6A700) : scheme.outline),
+                  tooltip: fav ? 'Remove from favourites' : 'Add to favourites',
+                ),
+                if (s == DoorState.out)
+                  IconButton(
+                    onPressed: () => _toggleAlert(id, name),
+                    icon: Icon(alert ? Icons.notifications_active : Icons.notifications_none, color: alert ? kOpen : scheme.outline),
+                    tooltip: 'Alert me when back',
+                  ),
+              ]),
+            ]),
+          ),
+        ),
       ),
+    );
+  }
+
+  void _openDetails(String id) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
+      builder: (ctx) => StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+        stream: FirebaseFirestore.instance.collection(facultyCollection).doc(id).snapshots(),
+        builder: (ctx, snap) {
+          final f = snap.data?.data();
+          if (f == null) return const SizedBox(height: 200, child: Center(child: CircularProgressIndicator()));
+          final scheme = Theme.of(ctx).colorScheme;
+          final s = doorOf(f);
+          final color = doorColor(s);
+          final name = (f['name'] ?? 'Faculty').toString();
+          final note = (f['note'] ?? '').toString();
+          final since = (f['since'] as num?)?.toInt() ?? (f['updatedAt'] as num?)?.toInt();
+          final events = todayEvents(f);
+          final alert = _alerts.contains(id);
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                Row(children: [
+                  Avatar(id: id, name: name, size: 56),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(name, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+                      Text('Floor ${f['cabinFloor']} · Cabin ${f['gender'] == 'F' ? 'L' : 'G'}${f['cabinNo']}',
+                          style: TextStyle(color: scheme.onSurfaceVariant)),
+                    ]),
+                  ),
+                ]),
+                const SizedBox(height: 14),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(color: color.withOpacity(0.12), borderRadius: BorderRadius.circular(14)),
+                  child: Row(children: [
+                    Icon(doorIcon(s), color: color),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text('${doorText(s)}${since != null ? ' · ${agoText(since)}' : ''}',
+                          style: TextStyle(color: color, fontWeight: FontWeight.w800)),
+                    ),
+                  ]),
+                ),
+                if (note.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  Text('“$note”', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+                ],
+                const SizedBox(height: 16),
+                const SectionLabel('Today'),
+                const SizedBox(height: 6),
+                if (events.isEmpty) Text('No activity yet today.', style: TextStyle(color: scheme.onSurfaceVariant)),
+                for (final (t, inside) in events.reversed.take(5))
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 3),
+                    child: Row(children: [
+                      Icon(Icons.circle, size: 9, color: inside ? kOpen : kClosed),
+                      const SizedBox(width: 10),
+                      Text(hm(t), style: const TextStyle(fontWeight: FontWeight.w700)),
+                      const SizedBox(width: 8),
+                      Text(inside ? 'Came in' : 'Went out'),
+                    ]),
+                  ),
+                const SizedBox(height: 18),
+                if (s == DoorState.out)
+                  FilledButton.icon(
+                    style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
+                    onPressed: () {
+                      _toggleAlert(id, name);
+                      Navigator.pop(ctx);
+                    },
+                    icon: Icon(alert ? Icons.notifications_off : Icons.notifications_active),
+                    label: Text(alert ? 'Turn off the alert' : 'Alert me when they\'re back'),
+                  ),
+                if (s == DoorState.out) const SizedBox(height: 8),
+                if (widget.onShowIn3D != null)
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      widget.onShowIn3D!(id);
+                    },
+                    icon: const Icon(Icons.view_in_ar),
+                    label: const Text('Show cabin in 3D'),
+                  ),
+              ]),
+            ),
+          );
+        },
       ),
     );
   }
@@ -379,7 +630,9 @@ class _Block3DScreenState extends State<Block3DScreen> {
           'cabinFloor': (f['cabinFloor'] as num?)?.toInt(),
           'cabinNo': (f['cabinNo'] as num?)?.toInt(),
           'cabinOpen': f['cabinOpen'] == true,
-          'updatedAt': (f['updatedAt'] as num?)?.toInt(),
+          'busy': f['busy'] == true,
+          'note': (f['note'] ?? '').toString(),
+          'updatedAt': ((f['since'] ?? f['updatedAt']) as num?)?.toInt(),
         };
       }).toList();
       _lastJson = jsonEncode(list);
@@ -908,6 +1161,28 @@ class Presence extends ChangeNotifier with WidgetsBindingObserver {
     return 'Floor ${m['cabinFloor']}, ${m['gender'] == 'F' ? 'L' : 'G'}${m['cabinNo']}';
   }
 
+  /// Short message shown to students ("" = available, no message).
+  Future<void> setNote(String note) async {
+    if (facultyId == null) return;
+    try {
+      await _doc.update({'note': note, 'updatedAt': _stamp()});
+    } catch (e) {
+      writeError = e.toString();
+      notifyListeners();
+    }
+  }
+
+  /// Do not disturb: students see "Inside · Busy" instead of "Door OPEN".
+  Future<void> setBusy(bool busy) async {
+    if (facultyId == null) return;
+    try {
+      await _doc.update({'busy': busy, 'updatedAt': _stamp()});
+    } catch (e) {
+      writeError = e.toString();
+      notifyListeners();
+    }
+  }
+
   Future<void> makeMyCabin(Room r) async {
     final gents = r.idx <= 4;
     try {
@@ -943,6 +1218,19 @@ class Presence extends ChangeNotifier with WidgetsBindingObserver {
       } else {
         data['status'] = 'away';
         data['cabinOpen'] = false;
+      }
+      // the door changed: remember since when, and add it to today's in/out list
+      final open = data['cabinOpen'] == true;
+      if ((me?['cabinOpen'] == true) != open) {
+        final t = data['updatedAt'] as int;
+        data['since'] = t;
+        final event = {'t': t, 'in': open};
+        if (me?['todayDate'] == todayKey()) {
+          data['today'] = FieldValue.arrayUnion([event]);
+        } else {
+          data['todayDate'] = todayKey();
+          data['today'] = [event];
+        }
       }
     }
     _lastWrite = now;
@@ -993,9 +1281,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _body(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final me = p.me;
-    final cabinOpen = me?['cabinOpen'] == true;
     final now = DateTime.now();
-    // only beacons heard in the last 15 seconds (older readings are out of date)
     final nearby = p.seen.entries.where((e) => now.difference(e.value.last) <= lostAfter).toList()
       ..sort((a, b) => b.value.rssi.compareTo(a.value.rssi));
     final foreignRecent = p.foreignAt != null && now.difference(p.foreignAt!) < const Duration(minutes: 2);
@@ -1009,156 +1295,232 @@ class _HomeScreenState extends State<HomeScreen> {
       return st.isPermanentlyDenied ? 'Blocked' : 'Not allowed';
     }
 
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(me?['name'] ?? 'Kalam Faculty'),
-        actions: [
-          IconButton(onPressed: _logout, icon: const Icon(Icons.switch_account), tooltip: 'Change faculty'),
-        ],
-      ),
-      body: ListView(padding: const EdgeInsets.all(16), children: [
-        if (p.otherPhoneOwns)
-          Card(
-            color: scheme.errorContainer,
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('${me?['name'] ?? 'This faculty'} is signed in on another phone',
-                    style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: scheme.onErrorContainer)),
-                const SizedBox(height: 4),
-                Text('Only one phone can report a cabin door. This phone has stopped reporting so the two phones do not fight.',
-                    style: TextStyle(color: scheme.onErrorContainer)),
-                const SizedBox(height: 10),
-                FilledButton(onPressed: p.claim, child: const Text('Use this phone instead')),
-              ]),
-            ),
-          )
-        else if (foreignRecent)
-          Card(
-            color: scheme.errorContainer,
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text('Another phone is also reporting as ${me?['name'] ?? 'this faculty'} and is changing the door. '
-                  'On that phone, open Kalam Faculty and tap the person icon (Change faculty), or uninstall the app there. '
-                  'Use only one phone per faculty.',
-                  style: TextStyle(color: scheme.onErrorContainer, fontWeight: FontWeight.w600)),
-            ),
-          ),
-        if (p.writeError != null)
-          Card(
-            color: scheme.errorContainer,
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text('Could not save to Firebase, so students may see old information.\n${p.writeError}',
-                  style: TextStyle(color: scheme.onErrorContainer)),
-            ),
-          ),
-        if (p.problem != null)
-          Card(color: scheme.errorContainer, child: Padding(padding: const EdgeInsets.all(16), child: Text(p.problem!, style: TextStyle(color: scheme.onErrorContainer)))),
-        Card(
+    final name = (me?['name'] ?? 'Faculty').toString();
+    final door = me == null ? DoorState.out : doorOf(me);
+    final color = doorColor(door);
+    final busy = me?['busy'] == true;
+    final note = (me?['note'] ?? '').toString();
+    final minutes = me == null ? 0 : minutesInCabinToday(me);
+    final since = (me?['since'] as num?)?.toInt();
+    final hour = now.hour;
+    final greeting = hour < 12 ? 'Good morning' : (hour < 17 ? 'Good afternoon' : 'Good evening');
+    final bestRssi = nearby.isEmpty ? null : nearby.first.value.rssi.round();
+
+    Widget warn(String title, String text, {Widget? action}) => Card(
+          color: scheme.errorContainer,
           child: Padding(
-            padding: const EdgeInsets.all(20),
+            padding: const EdgeInsets.all(16),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('YOU ARE IN', style: TextStyle(fontSize: 12, letterSpacing: 1.2, color: scheme.onSurfaceVariant)),
-              const SizedBox(height: 6),
-              Text(p.room?.fullLabel ?? 'Not in any room', style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w700)),
-              const SizedBox(height: 6),
-              Text(p.room == null
-                  ? 'You are away from your cabin beacon.'
-                  : (p.isOwnCabin(p.room!) ? 'This is your cabin.' : 'This is not your saved cabin.'),
-                  style: TextStyle(color: scheme.onSurfaceVariant)),
-              if (p.room != null && !p.isOwnCabin(p.room!) && p.room!.idx <= 8) ...[
-                const SizedBox(height: 10),
-                Text('Your saved cabin is ${p.myCabinLabel()}, so students see your door CLOSED. '
-                    'If this room is your cabin, tap below.',
-                    style: TextStyle(color: scheme.error, fontWeight: FontWeight.w600)),
-                const SizedBox(height: 8),
-                FilledButton.icon(
-                  onPressed: () => p.makeMyCabin(p.room!),
-                  icon: const Icon(Icons.check),
-                  label: Text('Make ${p.room!.label} my cabin'),
-                ),
-              ],
-            ]),
-          ),
-        ),
-        const SizedBox(height: 8),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('WHAT STUDENTS SEE', style: TextStyle(fontSize: 12, letterSpacing: 1.2, color: scheme.onSurfaceVariant)),
-              const SizedBox(height: 12),
-              Row(children: [
-                Icon(cabinOpen ? Icons.meeting_room : Icons.door_front_door,
-                    size: 44, color: cabinOpen ? Colors.green.shade600 : Colors.red.shade600),
-                const SizedBox(width: 14),
-                Expanded(child: Text(cabinOpen ? 'Door OPEN\nYou are inside your cabin' : 'Door CLOSED\nYou are not in your cabin',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: cabinOpen ? Colors.green.shade600 : Colors.red.shade600))),
-              ]),
-              const SizedBox(height: 8),
-              Text('Automatic: inside your cabin = OPEN, away from it = CLOSED (about 15 seconds after you leave).',
-                  style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant)),
-            ]),
-          ),
-        ),
-        const SizedBox(height: 8),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('BEACONS NEARBY', style: TextStyle(fontSize: 12, letterSpacing: 1.2, color: scheme.onSurfaceVariant)),
-              const SizedBox(height: 8),
-              if (nearby.isEmpty) const Text('Searching… none found yet.'),
-              for (final e in nearby)
-                ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.bluetooth, color: e.value.rssi >= enterRssi ? Colors.green : scheme.outline),
-                  title: Text(parseBeacon(e.key)?.fullLabel ?? e.key),
-                  subtitle: Text(e.key),
-                  trailing: Text('${e.value.rssi.round()} dBm', style: const TextStyle(fontFeatures: [FontFeature.tabularFigures()])),
-                ),
-            ]),
-          ),
-        ),
-        const SizedBox(height: 8),
-        Card(
-          color: noResults ? scheme.errorContainer : null,
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('PHONE CHECK', style: TextStyle(fontSize: 12, letterSpacing: 1.2, color: scheme.onSurfaceVariant)),
-              const SizedBox(height: 8),
-              Text('Kalam beacons heard: $deviceCount'),
-              Text('Nearby devices permission: ${permText(Permission.bluetoothScan)}'),
-              Text('Location permission: ${permText(Permission.location)}'),
-              Text('Location (GPS) switch: ${p.locationServiceOn ? 'On' : 'Off'}'),
-              Text('Background mode: ${p.bgRunning ? 'On (works with the phone locked)' : 'Off'}'),
-              Text('This phone ID: ${p.deviceId ?? '…'} · ${p.otherPhoneOwns ? 'not reporting' : 'reporting'}'),
-              if (noResults) ...[
-                const SizedBox(height: 10),
-                const Text('No Kalam beacon heard right now. This is normal when you are away from your cabin. '
-                    'If you are inside your cabin and this stays red for over a minute, close the app fully, '
-                    'wait 30 seconds and open it again.'),
-              ],
+              Text(title, style: TextStyle(fontWeight: FontWeight.w800, color: scheme.onErrorContainer)),
               const SizedBox(height: 4),
-              Wrap(spacing: 8, runSpacing: 8, children: [
-                FilledButton.icon(
-                  onPressed: () async { await p.checkPermissions(); await p.startScan(force: true); },
-                  icon: const Icon(Icons.refresh), label: const Text('Scan again'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () => openAppSettings(),
-                  icon: const Icon(Icons.settings), label: const Text('App settings'),
-                ),
-              ]),
+              Text(text, style: TextStyle(color: scheme.onErrorContainer)),
+              if (action != null) ...[const SizedBox(height: 10), action],
             ]),
           ),
+        );
+
+    const notes = ['In a meeting', 'Back in 10 min', 'Lunch break', 'Exam duty', 'Taking class'];
+
+    return Scaffold(
+      body: ListView(padding: EdgeInsets.zero, children: [
+        GradientHeader(
+          colors: const [kFacultyBlue, kFacultyBlue2],
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(greeting, style: const TextStyle(fontSize: 13, color: Colors.white70)),
+                const SizedBox(height: 2),
+                Text(name, style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w800, color: Colors.white)),
+                const SizedBox(height: 2),
+                Text(me == null ? 'Loading…' : 'Floor ${me['cabinFloor']} · Cabin ${p.myCabinLabel().split(', ').last}',
+                    style: const TextStyle(fontSize: 13.5, color: Colors.white70)),
+              ]),
+            ),
+            IconButton(
+              onPressed: _logout,
+              icon: const Icon(Icons.switch_account, color: Colors.white),
+              tooltip: 'Change faculty',
+            ),
+          ]),
         ),
-        const SizedBox(height: 12),
-        Text('You can lock the phone and keep it in your pocket. Just do not swipe the app away from recent apps.',
-            textAlign: TextAlign.center, style: TextStyle(color: scheme.onSurfaceVariant)),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            if (p.otherPhoneOwns)
+              warn('$name is signed in on another phone',
+                  'Only one phone can report a cabin door. This phone has stopped reporting so the two phones do not fight.',
+                  action: FilledButton(onPressed: p.claim, child: const Text('Use this phone instead')))
+            else if (foreignRecent)
+              warn('Another phone is also reporting as $name',
+                  'On that phone, open Kalam Faculty and tap the person icon (Change faculty), or uninstall the app there.'),
+            if (p.writeError != null) warn('Could not save to Firebase', 'Students may see old information.\n${p.writeError}'),
+            if (p.problem != null) warn('Bluetooth', p.problem!),
+            if (p.room != null && !p.isOwnCabin(p.room!) && p.room!.idx <= 8)
+              warn('You are in ${p.room!.fullLabel}',
+                  'Your saved cabin is ${p.myCabinLabel()}, so students see your door CLOSED. If this room is your cabin, tap below.',
+                  action: FilledButton(onPressed: () => p.makeMyCabin(p.room!), child: Text('Make ${p.room!.label} my cabin'))),
+            if (p.otherPhoneOwns || foreignRecent || p.writeError != null || p.problem != null ||
+                (p.room != null && !p.isOwnCabin(p.room!) && p.room!.idx <= 8))
+              const SizedBox(height: 12),
+
+            // ---- big status ----
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 26, horizontal: 16),
+                child: Column(children: [
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 400),
+                    width: 132,
+                    height: 132,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: color,
+                      boxShadow: [
+                        BoxShadow(color: color.withOpacity(0.22), spreadRadius: 12),
+                        BoxShadow(color: color.withOpacity(0.10), spreadRadius: 26),
+                      ],
+                    ),
+                    child: Icon(doorIcon(door), color: Colors.white, size: 60),
+                  ),
+                  const SizedBox(height: 30),
+                  Text(
+                    door == DoorState.out ? 'You are out of your cabin' : (busy ? 'In your cabin · Busy' : 'You\'re in your cabin'),
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: color),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Students see: ${doorText(door)}${since != null ? ' · since ${hm(since)}' : ''}',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: scheme.onSurfaceVariant),
+                  ),
+                  if (note.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      decoration: BoxDecoration(color: scheme.surfaceContainerHighest, borderRadius: BorderRadius.circular(12)),
+                      child: Text('“$note”', style: const TextStyle(fontWeight: FontWeight.w600)),
+                    ),
+                  ],
+                ]),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // ---- message for students ----
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const SectionLabel('Message for students'),
+                  const SizedBox(height: 10),
+                  Wrap(spacing: 8, runSpacing: 8, children: [
+                    ChoiceChip(label: const Text('Available'), selected: note.isEmpty, onSelected: (_) => p.setNote('')),
+                    for (final n in notes) ChoiceChip(label: Text(n), selected: note == n, onSelected: (_) => p.setNote(note == n ? '' : n)),
+                  ]),
+                ]),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // ---- do not disturb ----
+            Card(
+              child: SwitchListTile(
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                title: const Text('Do not disturb', style: TextStyle(fontWeight: FontWeight.w700)),
+                subtitle: const Text('Students see "Inside · Busy" while you are in your cabin'),
+                value: busy,
+                activeColor: kBusy,
+                onChanged: me == null ? null : (v) => p.setBusy(v),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // ---- stats ----
+            Row(children: [
+              Expanded(child: _stat(durationText(minutes), 'In cabin today', Icons.timer_outlined, scheme)),
+              const SizedBox(width: 12),
+              Expanded(child: _stat(bestRssi == null ? '—' : '$bestRssi', 'Beacon signal (dBm)', Icons.bluetooth, scheme)),
+            ]),
+            const SizedBox(height: 12),
+
+            // ---- today ----
+            if (me != null && todayEvents(me).isNotEmpty)
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const SectionLabel('Today'),
+                    const SizedBox(height: 8),
+                    for (final (t, inside) in todayEvents(me).reversed.take(6))
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Row(children: [
+                          Icon(Icons.circle, size: 10, color: inside ? kOpen : kClosed),
+                          const SizedBox(width: 10),
+                          Text(hm(t), style: const TextStyle(fontWeight: FontWeight.w700, fontFeatures: [FontFeature.tabularFigures()])),
+                          const SizedBox(width: 10),
+                          Text(inside ? 'Came in' : 'Went out'),
+                        ]),
+                      ),
+                  ]),
+                ),
+              ),
+            if (me != null && todayEvents(me).isNotEmpty) const SizedBox(height: 12),
+
+            // ---- phone check (folded) ----
+            Card(
+              clipBehavior: Clip.antiAlias,
+              child: ExpansionTile(
+                initiallyExpanded: false,
+                leading: Icon(Icons.health_and_safety_outlined, color: noResults ? scheme.error : scheme.primary),
+                title: const Text('Phone check', style: TextStyle(fontWeight: FontWeight.w700)),
+                subtitle: Text(p.bgRunning ? 'Running in the background' : 'Background mode is off'),
+                childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                expandedCrossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  for (final e in nearby)
+                    Text('${parseBeacon(e.key)?.fullLabel ?? e.key}: ${e.value.rssi.round()} dBm'),
+                  if (nearby.isEmpty) const Text('No cabin beacon heard right now (normal when you are away).'),
+                  const SizedBox(height: 8),
+                  Text('Nearby devices permission: ${permText(Permission.bluetoothScan)}'),
+                  Text('Location permission: ${permText(Permission.location)}'),
+                  Text('Location (GPS) switch: ${p.locationServiceOn ? 'On' : 'Off'}'),
+                  Text('Background mode: ${p.bgRunning ? 'On (works with the phone locked)' : 'Off'}'),
+                  Text('This phone ID: ${p.deviceId ?? '…'} · ${p.otherPhoneOwns ? 'not reporting' : 'reporting'}'),
+                  const SizedBox(height: 10),
+                  Wrap(spacing: 8, runSpacing: 8, children: [
+                    FilledButton.tonalIcon(
+                      onPressed: () async {
+                        await p.checkPermissions();
+                        await p.startScan(force: true);
+                      },
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Scan again'),
+                    ),
+                    OutlinedButton.icon(onPressed: () => openAppSettings(), icon: const Icon(Icons.settings), label: const Text('App settings')),
+                  ]),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            Text('You can lock the phone and keep it in your pocket. Just do not swipe the app away.',
+                textAlign: TextAlign.center, style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12.5)),
+          ]),
+        ),
       ]),
     );
   }
+
+  Widget _stat(String value, String label, IconData icon, ColorScheme scheme) => Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Icon(icon, size: 20, color: scheme.primary),
+            const SizedBox(height: 8),
+            Text(value, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800, fontFeatures: [FontFeature.tabularFigures()])),
+            Text(label, style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
+          ]),
+        ),
+      );
 }

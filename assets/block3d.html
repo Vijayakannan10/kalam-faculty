@@ -34,6 +34,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:
 .pill{font-size:12px;font-weight:700;border-radius:999px;padding:4px 10px;white-space:nowrap}
 .pill.open{background:var(--open-bg);color:var(--open)}
 .pill.closed{background:var(--closed-bg);color:var(--closed)}
+.pill.busy{background:#fbf0dc;color:#a2620a}
 #close{position:absolute;top:8px;right:10px;border:0;background:none;color:var(--muted);font-size:22px;line-height:1}
 .hint{position:fixed;left:12px;bottom:12px;font-size:11.5px;color:var(--muted);pointer-events:none}
 #loading{position:fixed;inset:0;display:grid;place-items:center;font-size:14px;color:var(--muted);pointer-events:none}
@@ -46,6 +47,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:
   <div class="legend">
     <span id="count">Loading…</span>
     <span><i style="background:#22a35a"></i>Inside · door open</span>
+    <span><i style="background:#d08a12"></i>Inside · busy</span>
     <span><i style="background:#d0402f"></i>Went out · door closed</span>
     <span><i style="background:#c9cfd9"></i>No faculty</span>
   </div>
@@ -79,7 +81,7 @@ scene.add(new THREE.HemisphereLight(0xffffff, 0x8a93a3, 0.95));
 const sun = new THREE.DirectionalLight(0xffffff, 0.5); sun.position.set(10, 30, 20); scene.add(sun);
 
 const COL = { classroom:0xb9c7b0, lab:0xc3bad6, hod:0xe0a96d, stair:0x5e6676, lift:0x3f78b5, wc:0xd5d9e0, slab:0xe4e7ee,
-              cabinIdle:0xc9cfd9, open:0x22a35a, closed:0xd0402f };
+              cabinIdle:0xc9cfd9, open:0x22a35a, busy:0xd08a12, closed:0xd0402f };
 const SLOTS = [{t:'stair',w:1.6},{t:'lift',w:1.4},{i:'lab1',w:2.6},
   {c:1,w:2.4},{c:2,w:2.4},{c:3,w:2.4},{c:4,w:2.4},{c:5,w:2.4},{t:'stair',w:2.4,centre:true},
   {c:6,w:2.4},{c:7,w:2.4},{c:8,w:2.4},{c:9,w:2.4},{c:10,w:2.4},{i:'hod',w:2.6},{t:'stair',w:1.6}];
@@ -180,11 +182,12 @@ function paint(){
   Object.entries(byKey).forEach(([key, list]) => {
     const c = cabinMeshes[key]; if (!c) return;
     const open = list.some(p => p.cabinOpen === true);
-    c.mesh.material.color.setHex(open ? COL.open : COL.closed);
+    const busy = open && list.filter(p => p.cabinOpen === true).every(p => p.busy === true);
+    c.mesh.material.color.setHex(open ? (busy ? COL.busy : COL.open) : COL.closed);
     const p0 = list.find(p => p.cabinOpen === true) || list[0];
     const pos = cabinPos(c.side, c.n);
     const label = list.length > 1 ? `${initials(p0.name)}+${list.length-1}` : initials(p0.name);
-    const sm = new THREE.SpriteMaterial({ map: tex(label, null, 192, 112, open ? '#17834a' : '#c03a2b', '#ffffff'), depthTest: false, transparent: true, opacity: 1 });
+    const sm = new THREE.SpriteMaterial({ map: tex(label, null, 192, 112, open ? (busy ? '#b0700a' : '#17834a') : '#c03a2b', '#ffffff'), depthTest: false, transparent: true, opacity: 1 });
     (floorMats[c.floor] ||= []).push(sm);
     const s = new THREE.Sprite(sm); s.scale.set(1.1, 0.64, 1); s.position.set(pos.x, FY(c.floor) + 1.35, pos.z); s.renderOrder = 10;
     s.userData = { key, pin: true, floor: c.floor, base: FY(c.floor) + 1.35 };
@@ -225,8 +228,8 @@ function showCard(key){
   const c = cabinMeshes[key]; if (!c) return;
   const list = faculty.filter(p => facKey(p) === key);
   const rows = list.length ? list.map(p => `<div class="row"><span class="name">${esc(p.name)}</span>
-      <span class="pill ${p.cabinOpen ? 'open' : 'closed'}">${p.cabinOpen ? 'Inside · Door OPEN' : 'Went out · Door CLOSED'}</span></div>
-      <div class="sub" style="margin:-4px 0 4px">${p.cabinOpen ? 'Came in ' : 'Left '}${ago(p.updatedAt)}</div>`).join('')
+      <span class="pill ${p.cabinOpen ? (p.busy ? 'busy' : 'open') : 'closed'}">${p.cabinOpen ? (p.busy ? 'Inside · Busy' : 'Inside · Door OPEN') : 'Went out · Door CLOSED'}</span></div>
+      <div class="sub" style="margin:-4px 0 4px">${p.cabinOpen ? 'Came in ' : 'Left '}${ago(p.updatedAt)}${p.note ? ' · “' + esc(p.note) + '”' : ''}</div>`).join('')
     : `<div class="sub" style="padding:8px 0">No faculty assigned to this cabin.</div>`;
   $('#cardBody').innerHTML = `<h3>Floor ${c.floor} · Cabin ${c.side}${c.n}</h3><div class="sub">${c.side === 'G' ? 'Gents' : 'Ladies'} faculty cabins, below the centre stairs</div>${rows}`;
   $('#card').hidden = false; $('#hint').hidden = true;
